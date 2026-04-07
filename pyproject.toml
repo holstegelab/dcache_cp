@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools >= 64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcache-cp"
+version = "0.1.0"
+description = "Copy files to/from dCache with Adler-32 verification and tape staging."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Marc" }]
+
+[project.scripts]
+dcache_cp = "dcache_cp.cli:entry_point"
+dcache_ls = "dcache_cp.ls:entry_point"
