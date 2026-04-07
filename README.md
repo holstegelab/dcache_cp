@@ -4,6 +4,8 @@ Tools for working with dCache:
 
 - **`dcache_cp`** — Copy files to/from dCache with **Adler-32 checksum verification**.
   Downloads include automatic **tape staging** (bulk pin) and optional destaging.
+- **`dcache_mv`** — Move files to/from dCache by running a verified copy and then
+  deleting the source file only after success.
 - **`dcache_ls`** — List dCache directory contents like `ls`, with file locality
   and pin status.
 
@@ -23,7 +25,7 @@ pip install .
 pip install -e .
 ```
 
-This installs the `dcache_cp` and `dcache_ls` commands.
+This installs the `dcache_cp`, `dcache_mv`, and `dcache_ls` commands.
 
 ## Quick start
 
@@ -31,8 +33,14 @@ This installs the `dcache_cp` and `dcache_ls` commands.
 # Upload a directory to dCache
 dcache_cp ./experiment_results/ dcache:/results/ -R
 
+# Move a file into dCache (delete local source after verified upload)
+dcache_mv ./sample.bam dcache:/results/sample.bam
+
 # Download from dCache (stages from tape automatically, in batches)
 dcache_cp dcache:/results/ ./local_copy/ -R
+
+# Move a file out of dCache (delete remote source after verified download)
+dcache_mv dcache:/results/sample.bam ./sample.bam
 
 # Download using a custom remote prefix (uses ~/macaroons/analysis.conf)
 dcache_cp analysis:/archive/run42/ ./run42/ -R
@@ -119,6 +127,18 @@ space.
 Use `--no-stage` if files are already online.  Use `--no-destage` to keep
 them pinned.
 
+### Move flow
+
+`dcache_mv` reuses the same transfer engine as `dcache_cp`, but deletes the
+source only after the copy has been checksum-verified.
+
+- Upload move: verified upload, then delete the local source file
+- Download move: verified download, then delete the remote source file
+- Recursive moves delete transferred source files, but do not remove now-empty
+  source directories
+- In `--file-list` mode, resumed move rows are skipped when the source is
+  already gone but the destination file already exists
+
 ### File list mode
 
 Instead of source/destination arguments, provide a two-column TSV file:
@@ -160,8 +180,8 @@ The final summary also prints the current quota state.
 
 ```
 positional arguments:
-  source               Source path (prefix with <remote>: for dCache)
-  destination          Destination path (prefix with <remote>: for dCache)
+  path [path ...]      Source(s) and destination. Last argument is the destination
+                       (prefix with <remote>: for dCache). Multiple sources supported.
 
 options:
   --file-list TSV      Two-column TSV: source<TAB>destination per line
@@ -175,7 +195,8 @@ options:
   --workers N          Concurrent transfer threads (default: 4)
   --max-retries N      Max retries on checksum mismatch (default: 3)
   --retry-wait SEC     Seconds between retries (default: 60)
-  --copy-timeout VAL   rclone --timeout value (default: 300m)
+  --copy-timeout VAL   rclone idle --timeout value (default: 300m)
+  --checksum-timeout N Max seconds to wait for dCache checksum (default: 14400 = 4h)
   --no-stage           Skip staging (download only)
   --no-destage         Keep files staged after download
   --stage-batch N      Files to stage per batch (default: 50)

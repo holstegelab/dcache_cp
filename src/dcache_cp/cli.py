@@ -23,14 +23,15 @@ rclone token/config file.
 from __future__ import annotations
 
 import argparse
+import atexit
 import configparser
-import concurrent.futures
 import csv
 import hashlib
 import json
 import logging
 import os
 import posixpath
+import queue
 import shlex
 import subprocess
 import sys
@@ -47,104 +48,50 @@ from . import __version__
 LOG = logging.getLogger("dcache_cp")
 
 DEFAULT_COPY_TIMEOUT = "300m"
-DEFAULT_STAGE_TIMEOUT = 86400  # 24 h
-DEFAULT_STAGE_POLL = 60  # seconds
-DEFAULT_STAGE_BATCH = 50  # files staged at a time
-MACAROON_DIR = Path("~/macaroons").expanduser()
+DEFAULT_CHECKSUM_TIMEOUT = 4 * 3600  # 4 h — TB-class files can take hours
 
-_ADA_URL = (
-    "https://raw.githubusercontent.com/sara-nl/SpiderScripts"
-    "/refs/heads/master/ada/ada"
-)
-_ADA_CACHE = Path("~/.local/share/dcache_cp/ada").expanduser()
-_ADA_STAMP = Path("~/.local/share/dcache_cp/.ada_checked").expanduser()
-_ADA_CHECK_INTERVAL = 86400  # seconds — recheck GitHub once per day
+            src_prefix, src_path = parse_remote_prefix(src_raw)
+            dst_prefix, dst_path = parse_remote_prefix(dst_raw)
 
+            if src_prefix and dst_prefix:
+                raise ValueError(f"{path}:{lineno}: both columns have a remote prefix")
+            if not src_prefix and not dst_prefix:
+                raise ValueError(f"{path}:{lineno}: neither column has a remote prefix")
 
-def _update_ada() -> None:
-    """Download ada from GitHub, replacing the cache only if the content changed."""
-    try:
-        with urllib.request.urlopen(_ADA_URL, timeout=10) as resp:
-            data = resp.read()
-    except Exception as exc:
-        LOG.debug("Could not fetch ada from GitHub: %s", exc)
-        return
+            row_dir = "download" if src_prefix else "upload"
+            row_prefix = src_prefix or dst_prefix
 
-    if _ADA_CACHE.exists():
-        if hashlib.sha256(_ADA_CACHE.read_bytes()).digest() == hashlib.sha256(data).digest():
-            _ADA_STAMP.touch()
-            return
-        LOG.info("Updating ada from GitHub")
-    else:
-        LOG.info("Downloading ada from GitHub to %s", _ADA_CACHE)
+            if direction is None:
+                direction = row_dir
+            elif row_dir != direction:
+                raise ValueError(
+                    f"{path}:{lineno}: mixed directions; first row was {direction}, "
+                    f"this row is {row_dir}"
+                )
 
-    _ADA_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    _ADA_CACHE.write_bytes(data)
-    _ADA_CACHE.chmod(0o755)
-    _ADA_STAMP.touch()
-
-
-def _default_ada() -> str:
-    """Return path to ada: $ADA env var, or a cached copy kept fresh from GitHub."""
-    env = os.environ.get("ADA")
-    if env:
-        return env
-
-    # Re-check GitHub at most once per day; skip silently if unreachable.
-    needs_check = not _ADA_CACHE.exists() or (
-        not _ADA_STAMP.exists()
-        or (time.time() - _ADA_STAMP.stat().st_mtime) > _ADA_CHECK_INTERVAL
-    )
-    if needs_check:
-        _update_ada()
-
-    return str(_ADA_CACHE) if _ADA_CACHE.is_file() else "ada"
-
-# Project-level macaroon directories searched when ~/macaroons/ has no match
-_SNELLIUS_WORK_GLOBS = ["/gpfs/work*/0"]
-_SPIDER_PROJECT_DIR = Path("/project")
-
-DEFAULT_RCLONE_CONFIG_CANDIDATES = [
-    Path("~/config/rclone/rclone.conf"),   # Snellius-specific
-    Path("~/.config/rclone/rclone.conf"),
-]
-
-
-# ---------------------------------------------------------------------------
-# ANSI colors (disabled when stderr is not a terminal)
-# ---------------------------------------------------------------------------
-
-class _C:
-    """ANSI escape sequences.  Call ``_C.init(stream)`` once to enable/disable."""
-    RESET = BOLD = DIM = ""
-    RED = GREEN = YELLOW = BLUE = CYAN = MAGENTA = WHITE = ""
-    BG_GREEN = BG_RED = BG_BLUE = BG_YELLOW = ""
-
-    @classmethod
-    def init(cls, stream=None):
-        stream = stream or sys.stderr
-        if hasattr(stream, "isatty") and stream.isatty() and os.environ.get("NO_COLOR") is None:
-            cls.RESET   = "\033[0m"
-            cls.BOLD    = "\033[1m"
-            cls.DIM     = "\033[2m"
-            cls.RED     = "\033[31m"
-            cls.GREEN   = "\033[32m"
-            cls.YELLOW  = "\033[33m"
-            cls.BLUE    = "\033[34m"
-            cls.MAGENTA = "\033[35m"
-            cls.CYAN    = "\033[36m"
-            cls.WHITE   = "\033[37m"
-            cls.BG_GREEN  = "\033[42m"
-            cls.BG_RED    = "\033[41m"
-            cls.BG_BLUE   = "\033[44m"
-            cls.BG_YELLOW = "\033[43m"
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def setup_logging(verbose: bool):
+            if row_dir == "upload":
+                local = Path(src_path).expanduser().resolve()
+                if not local.is_file():
+                    raise FileNotFoundError(f"{path}:{lineno}: local file not found: {local}")
+                st = local.stat()
+                entries.append({
+                    "source": local,
+                    "resolved_source": local,
+                    "rel": local.name,
+                    "size": st.st_size,
+                    "remote_path": dst_path.strip("/"),
+                    "_prefix": row_prefix,
+                })
+            else:
+                remote_p = src_path.strip("/")
+                local_p = Path(dst_path).expanduser().resolve()
+                entries.append({
+                    "remote_path": remote_p,
+                    "local_path": local_p,
+                    "rel": posixpath.basename(remote_p),
+                    "size": 0,  # resolved after config/remote selection
+                    "_prefix": row_prefix,
+                })
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -361,6 +308,35 @@ def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProce
 # Adler-32
 # ---------------------------------------------------------------------------
 
+def _parse_adler32(output: str) -> str | None:
+    """Extract an Adler-32 value from ada --checksum output, or None if absent."""
+    for token in output.strip().split():
+        if "=" in token:
+            key, val = token.split("=", 1)
+            if key.lower().startswith("adler"):
+                return val.strip()
+    for line in output.splitlines():
+        if "adler32" not in line.lower():
+            continue
+        for part in line.replace(",", " ").split():
+            if part.lower().startswith("adler32="):
+                return part.split("=", 1)[1]
+    return None
+
+
+def _ada_reports_missing_path(output: str) -> bool:
+    """Return True when ada output indicates the target path does not exist."""
+    text = output.lower()
+    markers = (
+        '"status": "404"',
+        '"title": "not found"',
+        "no such file or directory",
+        "error while getting information about",
+        "could not determine type of object",
+    )
+    return all(marker in text for marker in markers[:2]) or any(marker in text for marker in markers[2:])
+
+
 def normalize_adler(value: str) -> str:
     s = str(value).strip().lower()
     if s.startswith("0x"):
@@ -371,23 +347,214 @@ def normalize_adler(value: str) -> str:
     return s.zfill(8)[-8:]
 
 
+_CHECKSUM_CACHE_ROOT = Path("~/.cache/dcache_cp/checksums").expanduser()
+_CHECKSUM_FLUSH_INTERVAL = 120  # seconds between background disk flushes
+
+
+def _dir_cache_path(directory: Path) -> Path:
+    """Map an absolute directory to its cache JSON file, mirroring the path.
+
+    /gpfs/work1/0/proj/bams/ → ~/.cache/dcache_cp/checksums/gpfs/work1/0/proj/bams.json
+    """
+    rel = directory.resolve().relative_to("/")
+    if not rel.parts:
+        return _CHECKSUM_CACHE_ROOT / "root.json"
+    return _CHECKSUM_CACHE_ROOT / rel.parent / (rel.name + ".json")
+
+
+class _ChecksumCache:
+    """In-process Adler-32 cache with periodic background flush to disk.
+
+    All threads share one in-memory dict.  The lock only guards the dict
+    (fast); checksum computation and disk I/O happen outside it.  Dirty
+    entries are written to disk every *flush_interval* seconds by a daemon
+    thread, and once more on exit via atexit.
+    """
+
+    def __init__(self, flush_interval: int = _CHECKSUM_FLUSH_INTERVAL) -> None:
+        self._lock = threading.Lock()
+        self._data: dict[Path, dict] = {}   # cache_path → {filename → entry}
+        self._dirty: set[Path] = set()
+        self._flush_interval = flush_interval
+        self._thread = threading.Thread(target=self._flush_loop, daemon=True,
+                                        name="checksum-cache-flusher")
+        self._thread.start()
+        atexit.register(self._flush_all)
+
+    def get(self, local_path: Path, st: os.stat_result) -> str | None:
+        """Return cached Adler-32 if the entry is fresh, else None."""
+        cache_path = _dir_cache_path(local_path.parent)
+        with self._lock:
+            if cache_path not in self._data:
+                self._data[cache_path] = self._load(cache_path)
+            entry = self._data[cache_path].get(local_path.name)
+        if (entry
+                and entry.get("size") == st.st_size
+                and entry.get("mtime_ns") == st.st_mtime_ns):
+            return entry["adler32"]
+        return None
+
+    def put(self, local_path: Path, adler_str: str, st: os.stat_result) -> None:
+        """Store a computed Adler-32; the background thread will flush to disk."""
+        cache_path = _dir_cache_path(local_path.parent)
+        with self._lock:
+            if cache_path not in self._data:
+                self._data[cache_path] = self._load(cache_path)
+            self._data[cache_path][local_path.name] = {
+                "adler32": adler_str,
+                "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
+            }
+            self._dirty.add(cache_path)
+
+    def _flush_all(self) -> None:
+        """Snapshot dirty entries and write them to disk outside the lock."""
+        with self._lock:
+            if not self._dirty:
+                return
+            snapshot = {p: dict(self._data[p]) for p in self._dirty}
+        for cache_path, data in snapshot.items():
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                tmp.replace(cache_path)
+                with self._lock:
+                    self._dirty.discard(cache_path)
+            except OSError as exc:
+                LOG.debug("could not write checksum cache %s: %s", cache_path, exc)
+
+    def _flush_loop(self) -> None:
+        while True:
+            time.sleep(self._flush_interval)
+            self._flush_all()
+
+    @staticmethod
+    def _load(cache_path: Path) -> dict:
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+
+_checksum_cache = _ChecksumCache()
+
+
 def adler32_local(local_path: Path) -> str:
+    """Return the Adler-32 of a local file, using the shared in-process cache.
+
+    Cache hits are served from memory (no I/O).  Misses compute the checksum
+    outside any lock and queue the result for the next background flush.
+    """
+    st = local_path.stat()
+    cached = _checksum_cache.get(local_path, st)
+    if cached is not None:
+        return cached
+
     adler = 1
     with local_path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(16 * 1024 * 1024), b""):
             adler = zlib.adler32(chunk, adler)
-    adler &= 0xFFFFFFFF
-    return f"{adler:08x}"
+    adler_str = f"{adler & 0xFFFFFFFF:08x}"
+
+    _checksum_cache.put(local_path, adler_str, st)
+    return adler_str
+
+
+def _run_in_daemon_thread(func, *args, name: str | None = None, **kwargs):
+    """Run a callable in a daemon thread and return a zero-arg waiter."""
+    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def _runner() -> None:
+        try:
+            result_queue.put((True, func(*args, **kwargs)))
+        except BaseException as exc:
+            result_queue.put((False, exc))
+
+    thread = threading.Thread(target=_runner, daemon=True, name=name)
+    thread.start()
+
+    def _wait():
+        ok, payload = result_queue.get()
+        if ok:
+            return payload
+        raise payload
+
+    return _wait
+
+
+class _DaemonWorkerPool:
+    """Run blocking transfer work in daemon threads and collect results via a queue."""
+
+    def __init__(self, worker_fn, workers: int, *, name_prefix: str):
+        self._worker_fn = worker_fn
+        self._work_queue: queue.Queue[dict | object] = queue.Queue()
+        self._result_queue: queue.Queue[tuple[dict, BaseException | None, dict | None]] = queue.Queue()
+        self._stop = threading.Event()
+        self._sentinel = object()
+        self._closed = False
+        self._threads = [
+            threading.Thread(target=self._worker, daemon=True, name=f"{name_prefix}-{index + 1}")
+            for index in range(workers)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def _worker(self) -> None:
+        while True:
+            try:
+                entry = self._work_queue.get(timeout=0.2)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+            try:
+                if entry is self._sentinel:
+                    return
+                try:
+                    result = self._worker_fn(entry)
+                except BaseException as exc:
+                    self._result_queue.put((entry, exc, None))
+                else:
+                    self._result_queue.put((entry, None, result))
+            finally:
+                self._work_queue.task_done()
+
+    def submit(self, entry: dict) -> None:
+        if self._closed:
+            raise RuntimeError("cannot submit work after closing daemon worker pool")
+        self._work_queue.put(entry)
+
+    def get_result(self, timeout: float | None = None) -> tuple[dict, BaseException | None, dict | None]:
+        return self._result_queue.get(timeout=timeout)
+
+    def get_result_nowait(self) -> tuple[dict, BaseException | None, dict | None]:
+        return self._result_queue.get_nowait()
+
+    def finish_submissions(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for _ in self._threads:
+            self._work_queue.put(self._sentinel)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.finish_submissions()
+
+    def join(self, timeout: float = 1.0) -> None:
+        for thread in self._threads:
+            thread.join(timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
 # File list parsing
 # ---------------------------------------------------------------------------
 
-def load_file_list(path: Path) -> tuple[str, list[dict]]:
+def load_file_list(path: Path, *, allow_missing_local: bool = False) -> tuple[str, list[dict]]:
     """Load a two-column TSV.  Returns (direction, entries).
 
-    Each row: ``<source>\\t<destination>``
+    Each row: ``<source>\t<destination>``
 
     Direction is auto-detected from the first row's remote prefix.
     All rows must have the same direction.
@@ -398,11 +565,11 @@ def load_file_list(path: Path) -> tuple[str, list[dict]]:
     with path.open("r", encoding="utf-8") as fh:
         reader = csv.reader(fh, delimiter="\t")
         for lineno, row in enumerate(reader, 1):
-            # skip blank lines and comments
-            if not row or (row[0].strip().startswith("#")):
+            if not row or row[0].strip().startswith("#"):
                 continue
             if len(row) < 2:
                 raise ValueError(f"{path}:{lineno}: expected 2 tab-separated columns, got {len(row)}")
+
             src_raw, dst_raw = row[0].strip(), row[1].strip()
             if not src_raw or not dst_raw:
                 raise ValueError(f"{path}:{lineno}: empty source or destination")
@@ -420,7 +587,6 @@ def load_file_list(path: Path) -> tuple[str, list[dict]]:
 
             if direction is None:
                 direction = row_dir
-                first_prefix = row_prefix
             elif row_dir != direction:
                 raise ValueError(
                     f"{path}:{lineno}: mixed directions; first row was {direction}, "
@@ -430,7 +596,18 @@ def load_file_list(path: Path) -> tuple[str, list[dict]]:
             if row_dir == "upload":
                 local = Path(src_path).expanduser().resolve()
                 if not local.is_file():
-                    raise FileNotFoundError(f"{path}:{lineno}: local file not found: {local}")
+                    if not allow_missing_local:
+                        raise FileNotFoundError(f"{path}:{lineno}: local file not found: {local}")
+                    entries.append({
+                        "source": local,
+                        "resolved_source": local,
+                        "rel": local.name,
+                        "size": 0,
+                        "remote_path": dst_path.strip("/"),
+                        "_prefix": row_prefix,
+                        "_missing_source": True,
+                    })
+                    continue
                 st = local.stat()
                 entries.append({
                     "source": local,
@@ -439,6 +616,7 @@ def load_file_list(path: Path) -> tuple[str, list[dict]]:
                     "size": st.st_size,
                     "remote_path": dst_path.strip("/"),
                     "_prefix": row_prefix,
+                    "_missing_source": False,
                 })
             else:
                 remote_p = src_path.strip("/")
@@ -447,14 +625,13 @@ def load_file_list(path: Path) -> tuple[str, list[dict]]:
                     "remote_path": remote_p,
                     "local_path": local_p,
                     "rel": posixpath.basename(remote_p),
-                    "size": 0,  # unknown until we check
+                    "size": 0,
                     "_prefix": row_prefix,
                 })
 
     if direction is None:
         raise ValueError(f"file list is empty: {path}")
 
-    # Ensure all rows use the same prefix
     prefixes = {e.pop("_prefix") for e in entries}
     if len(prefixes) > 1:
         raise ValueError(f"file list mixes remote prefixes: {prefixes}; use a single prefix")
@@ -462,11 +639,141 @@ def load_file_list(path: Path) -> tuple[str, list[dict]]:
     return direction, entries
 
 
+def _rclone_lsjson(
+    rclone_config: Path,
+    remote: str,
+    remote_path: str,
+    *,
+    recursive: bool = False,
+    missing_ok: bool = False,
+) -> list[dict]:
+    remote_path = remote_path.strip("/")
+    target = f"{remote}:{remote_path}" if remote_path else f"{remote}:"
+
+    cmd = [
+        "rclone", "--config", str(rclone_config),
+        "lsjson", target,
+    ]
+    if recursive:
+        cmd.append("--recursive")
+
+    result = run_command(cmd, check=not missing_ok)
+    if result.returncode != 0:
+        if missing_ok:
+            return []
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+    entries = json.loads(result.stdout)
+    if not isinstance(entries, list):
+        raise ValueError(f"unexpected lsjson output for {target}")
+    return entries
+
+
+def _fill_file_list_download_sizes(
+    rclone_config: Path,
+    remote: str,
+    files: list[dict],
+    *,
+    allow_resumed_move: bool = False,
+) -> list[dict]:
+    """Populate sizes for file-list download entries by listing each parent directory once."""
+    grouped: dict[str, set[str]] = {}
+    for entry in files:
+        remote_path = str(entry["remote_path"]).strip("/")
+        parent = posixpath.dirname(remote_path)
+        name = posixpath.basename(remote_path)
+        grouped.setdefault(parent, set()).add(name)
+
+    dir_sizes: dict[str, dict[str, int]] = {}
+    active_files: list[dict] = []
+    missing: list[str] = []
+    for parent, expected_names in grouped.items():
+        dir_entries = _rclone_lsjson(rclone_config, remote, parent, recursive=False, missing_ok=allow_resumed_move)
+        sizes: dict[str, int] = {}
+        for dir_entry in dir_entries:
+            if dir_entry.get("IsDir", False):
+                continue
+            path_name = dir_entry.get("Path")
+            if isinstance(path_name, str):
+                sizes[path_name] = int(dir_entry.get("Size", 0))
+        dir_sizes[parent] = sizes
+
+    for entry in files:
+        remote_path = str(entry["remote_path"]).strip("/")
+        parent = posixpath.dirname(remote_path)
+        name = posixpath.basename(remote_path)
+        if name in dir_sizes[parent]:
+            entry["size"] = dir_sizes[parent][name]
+            active_files.append(entry)
+            continue
+        if allow_resumed_move and Path(entry["local_path"]).exists():
+            LOG.info("skip %s (already moved)", entry["rel"])
+            continue
+        missing.append(remote_path)
+
+    if missing:
+        preview = ", ".join(sorted(missing)[:5])
+        suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+        raise FileNotFoundError(f"remote file(s) not found in file list: {preview}{suffix}")
+
+    return active_files
+
+
+def _filter_resumed_move_upload_file_list_entries(
+    rclone_config: Path,
+    remote: str,
+    files: list[dict],
+) -> list[dict]:
+    """Skip upload move rows whose local source is gone but remote destination already exists."""
+    grouped: dict[str, set[str]] = {}
+    active_files: list[dict] = []
+
+    for entry in files:
+        if not entry.get("_missing_source"):
+            active_files.append(entry)
+            continue
+        remote_path = str(entry["remote_path"]).strip("/")
+        parent = posixpath.dirname(remote_path)
+        name = posixpath.basename(remote_path)
+        grouped.setdefault(parent, set()).add(name)
+
+    if not grouped:
+        return active_files
+
+    dir_entries_by_parent: dict[str, set[str]] = {}
+    for parent in grouped:
+        dir_entries = _rclone_lsjson(rclone_config, remote, parent, recursive=False, missing_ok=True)
+        dir_entries_by_parent[parent] = {
+            str(dir_entry.get("Path"))
+            for dir_entry in dir_entries
+            if not dir_entry.get("IsDir", False) and isinstance(dir_entry.get("Path"), str)
+        }
+
+    missing: list[str] = []
+    for entry in files:
+        if not entry.get("_missing_source"):
+            continue
+        remote_path = str(entry["remote_path"]).strip("/")
+        parent = posixpath.dirname(remote_path)
+        name = posixpath.basename(remote_path)
+        if name in dir_entries_by_parent[parent]:
+            LOG.info("skip %s (already moved)", entry["rel"])
+            continue
+        missing.append(remote_path)
+
+    if missing:
+        preview = ", ".join(sorted(missing)[:5])
+        suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+        raise FileNotFoundError(f"source file(s) missing and destination not found: {preview}{suffix}")
+
+    return active_files
+
+
 # ---------------------------------------------------------------------------
 # Transfer planning
 # ---------------------------------------------------------------------------
 
-def plan_upload(source: Path, destination: str, recursive: bool) -> list[dict]:
+def plan_upload(source: Path, destination: str, recursive: bool,
+                spinner: "_EnumSpinner | None" = None) -> list[dict]:
     """Enumerate local files and map them to remote paths."""
     source = source.expanduser().resolve()
     if not source.exists():
@@ -481,6 +788,8 @@ def plan_upload(source: Path, destination: str, recursive: bool) -> list[dict]:
         resolved = source.resolve(strict=True)
         st = resolved.stat()
         remote = posixpath.join(cleaned, source.name) if dest_is_dir else cleaned
+        if spinner:
+            spinner.tick()
         return [{"source": source, "resolved_source": resolved, "rel": source.name,
                  "size": st.st_size, "remote_path": remote}]
 
@@ -502,29 +811,23 @@ def plan_upload(source: Path, destination: str, recursive: bool) -> list[dict]:
         st = resolved.stat()
         out.append({"source": path, "resolved_source": resolved, "rel": rel,
                      "size": st.st_size, "remote_path": posixpath.join(root, rel)})
+        if spinner:
+            spinner.tick()
     return out
 
 
 def plan_download(
     rclone_config: Path, remote: str, remote_path: str,
     local_dest: Path, recursive: bool,
+    spinner: "_EnumSpinner | None" = None,
 ) -> list[dict]:
     """Enumerate remote files via ``rclone lsjson`` and map them to local paths."""
+    entries = _rclone_lsjson(rclone_config, remote, remote_path, recursive=recursive)
     remote_path = remote_path.strip("/")
     if not remote_path:
         raise ValueError("remote path must not be empty")
 
     local_dest = local_dest.expanduser().resolve()
-
-    cmd = [
-        "rclone", "--config", str(rclone_config),
-        "lsjson", f"{remote}:{remote_path}",
-    ]
-    if recursive:
-        cmd.append("--recursive")
-
-    result = run_command(cmd)
-    entries = json.loads(result.stdout)
 
     if not entries:
         raise FileNotFoundError(f"no files found at remote path: {remote_path}")
@@ -543,6 +846,8 @@ def plan_download(
             "rel": rel,
             "size": size,
         })
+        if spinner:
+            spinner.tick()
 
     if not out:
         if not recursive:
@@ -581,6 +886,8 @@ class QuotaTracker:
         cmd += ["--space", self.poolgroup]
         result = run_command(cmd, check=False)
         if result.returncode != 0:
+            with self.lock:
+                self._ok = False
             LOG.debug("quota query failed: %s", result.stderr.strip())
             return
         try:
@@ -594,6 +901,8 @@ class QuotaTracker:
                 self.available = self.free + self.removable
                 self._ok = True
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            with self.lock:
+                self._ok = False
             LOG.debug("quota parse error: %s", exc)
 
     @property
@@ -638,10 +947,68 @@ class _QuotaPoller:
 
 
 # ---------------------------------------------------------------------------
+# Enumeration spinner
+# ---------------------------------------------------------------------------
+
+class _EnumSpinner:
+    """Shows a spinning cursor + file count on stderr while enumerating files.
+
+    Usage::
+
+        with _EnumSpinner("scanning") as sp:
+            for path in source.rglob("*"):
+                sp.tick()
+                ...
+    """
+    _FRAMES = r"⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, label: str = "scanning"):
+        self._label = label
+        self._count = 0
+        self._frame = 0
+        self._is_tty = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self._thread.join(timeout=1)
+        if self._is_tty:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+    def tick(self):
+        with self._lock:
+            self._count += 1
+
+    def _run(self):
+        while not self._stop.wait(0.1):
+            if not self._is_tty:
+                continue
+            with self._lock:
+                frame = self._frames[self._frame % len(self._frames)]
+                count = self._count
+            self._frame += 1
+            sys.stderr.write(f"\r\033[K  {frame} {self._label}… {count} files found")
+            sys.stderr.flush()
+
+    @property
+    def _frames(self):
+        return self._FRAMES
+
+
+# ---------------------------------------------------------------------------
 # Progress tracking & display
 # ---------------------------------------------------------------------------
 
 class Progress:
+    _SPEED_WINDOW = 30.0  # seconds for rolling speed average
+
     def __init__(self, total_files: int, total_bytes: int):
         self.total_files = total_files
         self.total_bytes = total_bytes
@@ -653,6 +1020,9 @@ class Progress:
         self.failed: list[tuple[str, str]] = []
         self.lock = threading.Lock()
         self.start_time = time.monotonic()
+        self.status = ""  # current per-worker activity shown in the bar
+        # Rolling window: list of (timestamp, bytes) for speed calculation
+        self._speed_samples: list[tuple[float, int]] = []
 
     def success(self, rel: str, size: int, attempts: int = 1, skipped: bool = False):
         with self.lock:
@@ -661,6 +1031,13 @@ class Progress:
             if skipped:
                 self.skipped_files += 1
                 self.skipped_bytes += size
+            else:
+                now = time.monotonic()
+                self._speed_samples.append((now, size))
+                # Trim samples outside the window
+                cutoff = now - self._SPEED_WINDOW
+                while self._speed_samples and self._speed_samples[0][0] < cutoff:
+                    self._speed_samples.pop(0)
             if attempts > 1:
                 self.total_retries += attempts - 1
             return self.validated_files, self.validated_bytes
@@ -669,6 +1046,21 @@ class Progress:
         with self.lock:
             self.failed.append((rel, str(exc)))
             return len(self.failed)
+
+    def speed_bps(self) -> float | None:
+        """Rolling average bytes/s over the last SPEED_WINDOW seconds."""
+        with self.lock:
+            if len(self._speed_samples) < 2:
+                return None
+            now = time.monotonic()
+            cutoff = now - self._SPEED_WINDOW
+            samples = [(t, b) for t, b in self._speed_samples if t >= cutoff]
+            if len(samples) < 2:
+                return None
+            window = samples[-1][0] - samples[0][0]
+            if window <= 0:
+                return None
+            return sum(b for _, b in samples) / window
 
     @property
     def done(self) -> int:
@@ -685,6 +1077,19 @@ class ProgressBar:
         self.stream = stream or sys.stderr
         self._is_tty = hasattr(self.stream, "isatty") and self.stream.isatty()
         self._lock = threading.Lock()
+        # Ticker: refreshes the bar every second so hashing status and speed
+        # stay current without waiting for a file to complete.
+        self._stop = threading.Event()
+        self._ticker = threading.Thread(target=self._tick_loop, daemon=True,
+                                        name="progress-ticker")
+        self._ticker.start()
+
+    def _tick_loop(self):
+        while not self._stop.wait(1.0):
+            self.update()
+
+    def stop(self):
+        self._stop.set()
 
     def update(self, last_file: str = ""):
         if not self._is_tty:
@@ -708,16 +1113,20 @@ class ProgressBar:
                 f"/{format_bytes(p.total_bytes)}"
             )
             time_str = f"{_C.DIM}{elapsed_str}<{eta_str}{_C.RESET}"
+            speed = p.speed_bps()
+            speed_str = f"  {_C.CYAN}{format_bytes(int(speed))}/s{_C.RESET}" if speed else ""
             err = ""
             if p.failed:
                 err = f"  {_C.RED}{_C.BOLD}err:{len(p.failed)}{_C.RESET}"
-            line = f"  {bar} {pct_str}  {files_str} files  {bytes_str}  {time_str}{err}"
-            if self.quota and self.quota.ok:
-                line += f"  {_C.DIM}|{_C.RESET} {self._quota_display()}"
-            elif last_file:
+            line = f"  {bar} {pct_str}  {files_str} files  {bytes_str}  {time_str}{speed_str}{err}"
+            # Always show hashing status when active; fall back to quota or last filename.
+            status = p.status or last_file
+            if status:
                 mx = 35
-                display = last_file if len(last_file) <= mx else "..." + last_file[-(mx - 3):]
+                display = status if len(status) <= mx else "..." + status[-(mx - 3):]
                 line += f"  {_C.DIM}{display}{_C.RESET}"
+            elif self.quota and self.quota.ok:
+                line += f"  {_C.DIM}|{_C.RESET} {self._quota_display()}"
             self.stream.write(f"\r\033[K{line}")
             self.stream.flush()
 
@@ -738,7 +1147,12 @@ class ProgressBar:
                 self.stream.flush()
 
 
-def print_summary(progress: Progress, direction: str, quota: QuotaTracker | None = None):
+def print_summary(
+    progress: Progress,
+    direction: str,
+    quota: QuotaTracker | None = None,
+    interrupted: bool = False,
+):
     elapsed = time.monotonic() - progress.start_time
     transferred_bytes = progress.validated_bytes - progress.skipped_bytes
     transferred_files = progress.validated_files - progress.skipped_files
@@ -778,11 +1192,15 @@ def print_summary(progress: Progress, direction: str, quota: QuotaTracker | None
     line(f"    elapsed   : {fmt_duration(elapsed)}")
     if elapsed > 0 and transferred_bytes > 0:
         line(f"    speed     : {_C.CYAN}{format_bytes(int(transferred_bytes / elapsed))}/s{_C.RESET}")
-    if quota and quota.ok:
+    if quota:
         quota.refresh()
-        line(f"    {quota.summary_line()}")
+        summary = quota.summary_line()
+        if summary:
+            line(f"    {summary}")
 
-    if not progress.failed:
+    if interrupted:
+        status = f"{_C.YELLOW}{_C.BOLD}! INTERRUPTED{_C.RESET}"
+    elif not progress.failed:
         status = f"{_C.GREEN}{_C.BOLD}\u2714 COMPLETED{_C.RESET}"
     else:
         status = f"{_C.RED}{_C.BOLD}\u2718 COMPLETED WITH ERRORS{_C.RESET}"
@@ -944,7 +1362,9 @@ class Transferer:
         max_retries: int,
         retry_wait: int,
         copy_timeout: str,
+        checksum_timeout: int = DEFAULT_CHECKSUM_TIMEOUT,
         skip_verified: bool = True,
+        delete_source: bool = False,
     ):
         self.rclone_config = Path(rclone_config).expanduser()
         self.remote = remote
@@ -953,7 +1373,10 @@ class Transferer:
         self.max_retries = max_retries
         self.retry_wait = retry_wait
         self.copy_timeout = copy_timeout
+        self.checksum_timeout = checksum_timeout
         self.skip_verified = skip_verified
+        self.delete_source = delete_source
+        self.progress: Progress | None = None  # set by caller to enable status updates
         self._seen_dirs: set[str] = set()
         self._dirs_lock = threading.Lock()
 
@@ -969,26 +1392,68 @@ class Transferer:
         if not remote_path:
             raise ValueError("remote path could not be derived")
         remote_dir = posixpath.dirname(remote_path)
-        local_adler = adler32_local(local_path)
 
+        # Skip-verification: check remote first (cheap API call).
+        # Only hash locally if the remote already has a checksum — avoids
+        # reading the entire file before uploading it on a cold run.
+        local_adler: str | None = None
         if self.skip_verified:
             try:
                 remote_adler = self._remote_adler(remote_path)
+                # Remote has a checksum — now compute local to compare.
+                if self.progress:
+                    self.progress.status = f"hashing {local_path.name}"
+                local_adler = adler32_local(local_path)
+                if self.progress:
+                    self.progress.status = ""
                 if normalize_adler(local_adler) == normalize_adler(remote_adler):
+                    self._delete_uploaded_source(entry)
                     LOG.debug("skip %s (verified)", rel)
                     return self._result(rel, remote_path, entry, local_adler, remote_adler, 0, True)
+            except FileNotFoundError:
+                LOG.debug("remote file missing for %s; uploading", rel)
             except Exception:
                 LOG.debug("remote checksum unavailable for %s; uploading", rel)
+            finally:
+                if self.progress:
+                    self.progress.status = ""
 
         for attempt in range(self.max_retries + 1):
             self._rclone_mkdir(remote_dir)
             self._rclone_copyto(str(local_path), f"{self.remote}:{remote_path}")
-            remote_adler = self._remote_adler(remote_path)
+            # Fetch remote checksum (may wait for dCache to compute it).
+            # Compute local hash concurrently in a thread so we don't add
+            # extra wall-clock time on top of the checksum wait.
+            if local_adler is None:
+                if self.progress:
+                    self.progress.status = f"hashing {local_path.name}"
+                wait_for_local_adler = _run_in_daemon_thread(
+                    adler32_local,
+                    local_path,
+                    name=f"hash-{local_path.name}",
+                )
+                if self.progress:
+                    self.progress.status = f"waiting checksum {local_path.name}"
+                try:
+                    remote_adler = self._remote_adler(remote_path)
+                    local_adler = wait_for_local_adler()
+                finally:
+                    if self.progress:
+                        self.progress.status = ""
+            else:
+                if self.progress:
+                    self.progress.status = f"waiting checksum {local_path.name}"
+                remote_adler = self._remote_adler(remote_path)
+                if self.progress:
+                    self.progress.status = ""
+
             if normalize_adler(local_adler) == normalize_adler(remote_adler):
+                self._delete_uploaded_source(entry)
                 return self._result(rel, remote_path, entry, local_adler, remote_adler, attempt + 1, False)
             LOG.warning("checksum mismatch %s: local=%s remote=%s (attempt %d/%d)",
                         rel, local_adler, remote_adler, attempt + 1, self.max_retries + 1)
             self._rclone_deletefile(f"{self.remote}:{remote_path}")
+            local_adler = None  # re-hash on retry in case file changed
             if attempt < self.max_retries:
                 time.sleep(self.retry_wait)
 
@@ -1007,6 +1472,7 @@ class Transferer:
                 remote_adler = self._remote_adler(remote_path)
                 local_adler = adler32_local(local_path)
                 if normalize_adler(local_adler) == normalize_adler(remote_adler):
+                    self._delete_downloaded_source(remote_path)
                     LOG.debug("skip %s (verified)", rel)
                     return self._dl_result(rel, remote_path, local_path, size, local_adler, remote_adler, 0, True)
             except Exception:
@@ -1018,6 +1484,7 @@ class Transferer:
             remote_adler = self._remote_adler(remote_path)
             local_adler = adler32_local(local_path)
             if normalize_adler(local_adler) == normalize_adler(remote_adler):
+                self._delete_downloaded_source(remote_path)
                 return self._dl_result(rel, remote_path, local_path, size, local_adler, remote_adler, attempt + 1, False)
             LOG.warning("checksum mismatch %s: local=%s remote=%s (attempt %d/%d)",
                         rel, local_adler, remote_adler, attempt + 1, self.max_retries + 1)
@@ -1042,23 +1509,60 @@ class Transferer:
                 "attempt": attempt, "skipped": skipped}
 
     def _remote_adler(self, remote_path: str) -> str:
+        """Fetch the remote Adler-32 via ada --checksum.
+
+        Retries within self.checksum_timeout seconds on:
+                - Missing remote path: raises FileNotFoundError immediately
+        - HTTP 429 (rate-limit): ada exits non-zero, backoff capped at 60 s
+        - Checksum not yet computed: ada exits 0 but no ADLER32 token
+          (dCache computes checksums asynchronously; TB-class files can take hours)
+          backoff grows to 5 min then stays there
+        Any other non-zero exit raises immediately.
+        """
         cmd = [self.ada_cmd, "--tokenfile", str(self.rclone_config)]
         if self.api:
             cmd += ["--api", self.api]
         cmd += ["--checksum", "/" + remote_path.strip("/")]
-        result = run_command(cmd)
-        for token in result.stdout.strip().split():
-            if "=" in token:
-                key, val = token.split("=", 1)
-                if key.lower().startswith("adler"):
-                    return val.strip()
-        for line in result.stdout.splitlines():
-            if "adler32" not in line.lower():
-                continue
-            for part in line.replace(",", " ").split():
-                if part.lower().startswith("adler32="):
-                    return part.split("=", 1)[1]
-        raise RuntimeError(f"cannot parse remote checksum for {remote_path}; ada output: {result.stdout.strip()!r}")
+
+        deadline = time.monotonic() + self.checksum_timeout
+        attempt = 0
+        while True:
+            result = run_command(cmd, check=False)
+            output = result.stdout + result.stderr
+
+            if _ada_reports_missing_path(output):
+                raise FileNotFoundError(f"remote path not found for checksum lookup: {remote_path}")
+
+            if result.returncode != 0:
+                if "429" in output:
+                    wait = min(2 ** attempt * 2, 60)  # 2 s … 60 s
+                    if time.monotonic() + wait < deadline:
+                        LOG.debug("ada rate-limited (429) for %s, retrying in %ds", remote_path, wait)
+                        time.sleep(wait)
+                        attempt += 1
+                        continue
+                # Non-429, or deadline would be exceeded waiting for 429 retry.
+                detail = (result.stdout.strip() or result.stderr.strip()).splitlines()[0]
+                LOG.debug("ada --checksum failed for %s (exit %d): %s",
+                          remote_path, result.returncode, detail)
+                raise RuntimeError(f"ada checksum unavailable for {remote_path}")
+
+            adler = _parse_adler32(output)
+            if adler is not None:
+                return adler
+
+            # dCache hasn't computed the checksum yet — poll with backoff.
+            wait = min(5 * 2 ** attempt, 300)  # 5 s, 10 s, 20 s … 5 min
+            elapsed = self.checksum_timeout - (deadline - time.monotonic())
+            if time.monotonic() + wait >= deadline:
+                raise RuntimeError(
+                    f"checksum not available for {remote_path} after {elapsed:.0f}s; "
+                    f"ada output: {result.stdout.strip()!r}"
+                )
+            LOG.debug("checksum not yet available for %s, retrying in %ds (elapsed %.0fs/%.0fs)",
+                      remote_path, wait, elapsed, self.checksum_timeout)
+            time.sleep(wait)
+            attempt += 1
 
     def _rclone_mkdir(self, remote_dir: str):
         if not remote_dir:
@@ -1079,6 +1583,17 @@ class Transferer:
     def _rclone_deletefile(self, target: str):
         run_command(["rclone", "--config", str(self.rclone_config), "-v", "deletefile", target])
 
+    def _delete_uploaded_source(self, entry: dict) -> None:
+        if not self.delete_source:
+            return
+        source_path = Path(entry.get("source", entry["resolved_source"]))
+        source_path.unlink()
+
+    def _delete_downloaded_source(self, remote_path: str) -> None:
+        if not self.delete_source:
+            return
+        self._rclone_deletefile(f"{self.remote}:{remote_path}")
+
 
 # ---------------------------------------------------------------------------
 # Execution strategies
@@ -1092,23 +1607,41 @@ def _execute_simple(
     bar: ProgressBar,
 ):
     """Simple parallel execution — used for uploads and --no-stage downloads."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {executor.submit(worker_fn, e): e for e in files}
-        for future in concurrent.futures.as_completed(future_map):
-            entry = future_map[future]
-            _handle_result(future, entry, progress, bar)
+    pool = _DaemonWorkerPool(worker_fn, workers, name_prefix="transfer-worker")
 
-
-def _handle_result(future: concurrent.futures.Future, entry: dict, progress: Progress, bar: ProgressBar):
-    """Process a completed transfer future: update progress and display."""
     try:
-        result = future.result()
-    except Exception as exc:
-        progress.failure(entry["rel"], exc)
-        bar.finish()
-        LOG.error("%s\u2718%s %s: %s", _C.RED, _C.RESET, entry["rel"], exc)
-        bar.update(entry["rel"])
-        return None
+        for i, e in enumerate(files):
+            pool.submit(e)
+            # Stagger the first wave of workers so they don't all hit the
+            # dCache checksum API simultaneously and trigger HTTP 429.
+            if i < workers - 1:
+                time.sleep(0.5)
+        pool.finish_submissions()
+
+        remaining = len(files)
+        while remaining:
+            try:
+                entry, exc, result = pool.get_result(timeout=0.2)
+            except queue.Empty:
+                continue
+            remaining -= 1
+            _handle_worker_result(entry, exc, result, progress, bar)
+    except KeyboardInterrupt:
+        pool.stop()
+        raise
+    finally:
+        pool.join(timeout=1)
+
+
+def _handle_failed_result(entry: dict, exc: BaseException, progress: Progress, bar: ProgressBar):
+    progress.failure(entry["rel"], exc)
+    bar.finish()
+    LOG.error("%s\u2718%s %s: %s", _C.RED, _C.RESET, entry["rel"], exc)
+    bar.update(entry["rel"])
+    return None
+
+
+def _handle_completed_result(result: dict, entry: dict, progress: Progress, bar: ProgressBar):
     skipped = result.get("skipped", False)
     progress.success(
         entry["rel"], entry.get("size", 0),
@@ -1126,6 +1659,20 @@ def _handle_result(future: concurrent.futures.Future, entry: dict, progress: Pro
         )
     bar.update(result["rel"])
     return result
+
+
+def _handle_worker_result(
+    entry: dict,
+    exc: BaseException | None,
+    result: dict | None,
+    progress: Progress,
+    bar: ProgressBar,
+):
+    if exc is not None:
+        return _handle_failed_result(entry, exc, progress, bar)
+    if result is None:
+        return _handle_failed_result(entry, RuntimeError("worker finished without a result"), progress, bar)
+    return _handle_completed_result(result, entry, progress, bar)
 
 
 def _execute_pipeline_download(
@@ -1152,7 +1699,6 @@ def _execute_pipeline_download(
     # Process in batches
     for batch_start in range(0, len(all_remote_paths), stage_batch):
         batch_paths = all_remote_paths[batch_start: batch_start + stage_batch]
-        batch_entries = [remote_path_to_entry[p] for p in batch_paths]
         batch_num = batch_start // stage_batch + 1
         total_batches = (len(all_remote_paths) + stage_batch - 1) // stage_batch
 
@@ -1162,30 +1708,28 @@ def _execute_pipeline_download(
         # Stage this batch
         stage_mgr.stage(batch_paths, lifetime=stage_lifetime)
 
-        # Wait for all files in this batch to come online, then download
-        # Use a polling thread that feeds online files to the download pool
-        online_set: set[str] = set()
+        # Wait for files in this batch to come online, then download them in daemon workers.
         pending_stage = set(batch_paths)
         completed_paths: list[str] = []
-        download_futures: dict[concurrent.futures.Future, dict] = {}
+        pending_downloads = 0
+        pool = _DaemonWorkerPool(transferer.download, workers, name_prefix="stage-download-worker")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        try:
             is_tty = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
             stage_start = time.monotonic()
 
-            while pending_stage or download_futures:
+            while pending_stage or pending_downloads:
                 # Check which pending files are now online
+                newly_online: list[str] = []
                 if pending_stage:
-                    newly_online = []
                     for path in list(pending_stage):
                         if stage_mgr.is_online(path):
                             newly_online.append(path)
                     for path in newly_online:
                         pending_stage.discard(path)
-                        online_set.add(path)
                         entry = remote_path_to_entry[path]
-                        fut = executor.submit(transferer.download, entry)
-                        download_futures[fut] = entry
+                        pool.submit(entry)
+                        pending_downloads += 1
 
                     # Show staging progress when still waiting
                     if pending_stage and is_tty:
@@ -1204,16 +1748,17 @@ def _execute_pipeline_download(
                         sys.stderr.flush()
 
                 # Check completed downloads
-                done_futures = []
-                for fut in list(download_futures):
-                    if fut.done():
-                        done_futures.append(fut)
-
-                for fut in done_futures:
-                    entry = download_futures.pop(fut)
-                    rp = "/" + str(entry["remote_path"]).strip("/")
-                    result = _handle_result(fut, entry, progress, bar)
-                    completed_paths.append(rp)
+                done_results = 0
+                while pending_downloads:
+                    try:
+                        entry, exc, result = pool.get_result_nowait()
+                    except queue.Empty:
+                        break
+                    pending_downloads -= 1
+                    done_results += 1
+                    handled = _handle_worker_result(entry, exc, result, progress, bar)
+                    if handled is not None:
+                        completed_paths.append("/" + str(entry["remote_path"]).strip("/"))
 
                 # Check staging timeout
                 if pending_stage:
@@ -1224,27 +1769,32 @@ def _execute_pipeline_download(
                         raise TimeoutError(
                             f"staging timed out; {len(pending_stage)} files still not online"
                         )
-                    if not done_futures and not newly_online:
+                    if not done_results and not newly_online:
                         time.sleep(stage_poll)
-                elif download_futures:
+                elif pending_downloads:
                     # All staged, just wait for downloads to finish
                     if is_tty:
                         sys.stderr.write("\r\033[K")
                         sys.stderr.flush()
                     try:
-                        done_iter = concurrent.futures.as_completed(download_futures, timeout=10)
-                        for fut in done_iter:
-                            entry = download_futures.pop(fut)
-                            rp = "/" + str(entry["remote_path"]).strip("/")
-                            _handle_result(fut, entry, progress, bar)
-                            completed_paths.append(rp)
-                            break  # back to outer loop to check for more
-                    except concurrent.futures.TimeoutError:
+                        entry, exc, result = pool.get_result(timeout=10)
+                    except queue.Empty:
                         pass
+                    else:
+                        pending_downloads -= 1
+                        handled = _handle_worker_result(entry, exc, result, progress, bar)
+                        if handled is not None:
+                            completed_paths.append("/" + str(entry["remote_path"]).strip("/"))
 
             if is_tty:
                 sys.stderr.write("\r\033[K")
                 sys.stderr.flush()
+        except KeyboardInterrupt:
+            pool.stop()
+            raise
+        finally:
+            pool.finish_submissions()
+            pool.join(timeout=1)
 
         # Destage this batch's files
         if destage and completed_paths:
@@ -1259,26 +1809,30 @@ def _execute_pipeline_download(
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, prog: str = "dcache_cp", delete_source: bool = False) -> argparse.ArgumentParser:
+    verb = "Move" if delete_source else "Copy"
+    action = "move" if delete_source else "copy"
     p = argparse.ArgumentParser(
-        prog="dcache_cp",
+        prog=prog,
         description=(
-            "Copy files to/from dCache with Adler-32 verification.\n\n"
+            f"{verb} files to/from dCache with Adler-32 verification.\n\n"
             "Use a remote prefix (e.g. dcache: or analysis:) on either\n"
             "source or destination to indicate the dCache side.\n"
             "The prefix selects ~/macaroons/<prefix>.conf automatically."
         ),
         epilog=(
-            "examples:\n"
-            "  dcache_cp ./data/ dcache:/data/   # upload\n"
-            "  dcache_cp dcache:/data/ ./data/   # download\n"
-            "  dcache_cp analysis:/archive/run1/ ./run1/ -R         # download with custom prefix\n"
-            "  dcache_cp --file-list transfers.tsv                  # from file list\n"
+            f"examples:\n"
+            f"  {prog} ./data/ dcache:/data/              # upload directory\n"
+            f"  {prog} file1.bam file2.bam dcache:/data/  # upload multiple files\n"
+            f"  {prog} dcache:/data/ ./data/ -R           # download\n"
+            f"  {prog} analysis:/archive/run1/ ./run1/ -R # download with custom prefix\n"
+            f"  {prog} --file-list transfers.tsv          # from file list\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("source", nargs="?", help="Source path (prefix with <remote>: for dCache)")
-    p.add_argument("destination", nargs="?", help="Destination path (prefix with <remote>: for dCache)")
+    p.add_argument("paths", nargs="*", metavar="path",
+                    help="Source(s) and destination. Last argument is the destination "
+                         "(prefix with <remote>: for dCache). Multiple sources are supported.")
     p.add_argument("--file-list", type=Path, metavar="TSV",
                     help="Two-column TSV file with source/destination pairs (one per line)")
     p.add_argument("-R", "--recursive", action="store_true", help="Copy directories recursively")
@@ -1293,12 +1847,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--api", help="dCache API URL override")
     p.add_argument("--dry-run", action="store_true", help="Show planned transfers without copying")
     p.add_argument("--no-skip-verified", dest="skip_verified", action="store_false", default=True,
-                    help="Re-upload/download even if checksum already matches (default: skip verified)")
+                    help=f"Re-{action} even if checksum already matches (default: skip verified)")
     p.add_argument("--workers", type=int, default=4, help="Concurrent transfer threads (default: 4)")
     p.add_argument("--max-retries", type=int, default=3, help="Max retries on checksum mismatch (default: 3)")
     p.add_argument("--retry-wait", type=int, default=60, help="Seconds between retries (default: 60)")
     p.add_argument("--copy-timeout", default=DEFAULT_COPY_TIMEOUT,
-                    help="rclone --timeout value (default: %(default)s)")
+                    help="rclone idle --timeout value (default: %(default)s)")
+    p.add_argument("--checksum-timeout", type=int, default=DEFAULT_CHECKSUM_TIMEOUT,
+                    metavar="SEC",
+                    help="Max seconds to wait for dCache to compute a checksum "
+                         "(default: 14400 = 4h; TB-class files can take hours)")
     # Staging options (download only)
     p.add_argument("--no-stage", action="store_true",
                     help="Skip staging; assume files are already online (download only)")
@@ -1320,51 +1878,47 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_source: bool = False) -> int:
+    parser = build_parser(prog=prog, delete_source=delete_source)
+    args = parser.parse_args(argv)
     setup_logging(args.verbose)
     _C.init()
 
     # ---- Determine source/dest and direction ----
     if args.file_list:
-        if args.source or args.destination:
-            LOG.error("do not specify source/destination when using --file-list")
+        if args.paths:
+            LOG.error("do not specify paths when using --file-list")
             return 1
-        direction, files = load_file_list(args.file_list)
-        # detect prefix from first entry to resolve config
-        if direction == "upload":
-            _, prefix_detect = parse_remote_prefix("upload:" + files[0]["remote_path"])
-            # Actually we need the prefix from the file list.  Re-parse.
-            # The prefix was validated in load_file_list; infer from original file.
-            # We'll re-read line 1 to get the prefix
-            with args.file_list.open("r") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    cols = line.split("\t")
-                    src_pf, _ = parse_remote_prefix(cols[0].strip())
-                    dst_pf, _ = parse_remote_prefix(cols[1].strip())
-                    prefix = src_pf or dst_pf
-                    break
-        else:
-            with args.file_list.open("r") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    cols = line.split("\t")
-                    src_pf, _ = parse_remote_prefix(cols[0].strip())
-                    dst_pf, _ = parse_remote_prefix(cols[1].strip())
-                    prefix = src_pf or dst_pf
-                    break
+        direction, files = load_file_list(args.file_list, allow_missing_local=delete_source)
+        # Detect remote prefix from first data row to resolve config.
+        with args.file_list.open("r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                cols = line.split("\t")
+                src_pf, _ = parse_remote_prefix(cols[0].strip())
+                dst_pf, _ = parse_remote_prefix(cols[1].strip())
+                prefix = src_pf or dst_pf
+                break
 
     else:
-        if not args.source or not args.destination:
-            parser.error("source and destination are required (or use --file-list)")
-        src_prefix, src_path = parse_remote_prefix(args.source)
-        dst_prefix, dst_path = parse_remote_prefix(args.destination)
+        if len(args.paths) < 2:
+            parser.error("provide at least one source and a destination (or use --file-list)")
+        *sources_raw, destination_raw = args.paths
+
+        dst_prefix, dst_path = parse_remote_prefix(destination_raw)
+
+        # Validate that all sources are on the same side (local or remote).
+        src_prefixes = []
+        for s in sources_raw:
+            sp, _ = parse_remote_prefix(s)
+            src_prefixes.append(sp)
+
+        if any(sp for sp in src_prefixes) and not all(sp for sp in src_prefixes):
+            LOG.error("mix of local and remote sources is not supported")
+            return 1
+        src_prefix = src_prefixes[0] if src_prefixes else None
 
         if src_prefix and dst_prefix:
             LOG.error("both source and destination have a remote prefix; only one side can be dCache")
@@ -1377,10 +1931,32 @@ def main() -> int:
         prefix = src_prefix or dst_prefix
 
         if direction == "upload":
-            files = plan_upload(Path(src_path), dst_path, args.recursive)
+            if len(sources_raw) > 1:
+                # Multiple sources must go into a directory destination.
+                dst_path_dir = dst_path if dst_path.endswith("/") else dst_path + "/"
+            else:
+                dst_path_dir = dst_path
+            files = []
+            with _EnumSpinner("scanning") as spinner:
+                for src_raw in sources_raw:
+                    _, src_path = parse_remote_prefix(src_raw)
+                    try:
+                        files.extend(plan_upload(Path(src_path), dst_path_dir, args.recursive,
+                                                 spinner=spinner))
+                    except ValueError as exc:
+                        LOG.error("%s", exc)
+                        return 1
+                    except FileNotFoundError as exc:
+                        LOG.error("%s", exc)
+                        return 1
         else:
-            # Need config to enumerate remote; resolve early
-            pass  # handled below after config resolution
+            # Download: multiple remote sources → local destination directory.
+            if len(sources_raw) > 1:
+                dst_path_dir = dst_path if dst_path.endswith("/") else dst_path + "/"
+            else:
+                dst_path_dir = dst_path
+            # Actual enumeration happens below after config is resolved.
+            pass
 
     # ---- Resolve config ----
     rclone_config = resolve_config_for_prefix(prefix, args.config)
@@ -1388,9 +1964,26 @@ def main() -> int:
     remote = resolve_remote_name(config, args.remote)
     api = resolve_api_url(args.api, config[remote])
 
+    if args.file_list and delete_source and direction == "upload":
+        files = _filter_resumed_move_upload_file_list_entries(rclone_config, remote, files)
+
+    if args.file_list and direction == "download":
+        files = _fill_file_list_download_sizes(
+            rclone_config,
+            remote,
+            files,
+            allow_resumed_move=delete_source,
+        )
+
     # ---- Plan downloads if not from file-list ----
     if not args.file_list and direction == "download":
-        files = plan_download(rclone_config, remote, src_path, Path(dst_path), args.recursive)
+        files = []
+        with _EnumSpinner("listing remote") as spinner:
+            for src_raw in sources_raw:
+                _, src_path = parse_remote_prefix(src_raw)
+                files.extend(plan_download(rclone_config, remote, src_path,
+                                           Path(dst_path_dir), args.recursive,
+                                           spinner=spinner))
 
     # ---- Validate ----
     if args.workers < 1:
@@ -1437,6 +2030,8 @@ def main() -> int:
     LOG.info("%sfiles%s   : %s%d%s (%s)", _C.DIM, _C.RESET, _C.CYAN, len(files), _C.RESET, format_bytes(total_bytes))
     LOG.info("%sworkers%s : %d  retries: %d  skip-verified: %s",
              _C.DIM, _C.RESET, args.workers, args.max_retries, "yes" if args.skip_verified else "no")
+    if delete_source:
+        LOG.info("%ssource%s  : delete after verified transfer", _C.DIM, _C.RESET)
     if direction == "download" and not args.no_stage:
         LOG.info("%sstaging%s : batch=%d  lifetime=%s  poll=%ds  timeout=%s",
                  _C.DIM, _C.RESET, args.stage_batch, args.stage_lifetime, args.stage_poll,
@@ -1449,11 +2044,14 @@ def main() -> int:
     transferer = Transferer(
         rclone_config=rclone_config, remote=remote, ada_cmd=args.ada,
         api=api, max_retries=args.max_retries, retry_wait=args.retry_wait,
-        copy_timeout=args.copy_timeout, skip_verified=args.skip_verified,
+        copy_timeout=args.copy_timeout, checksum_timeout=args.checksum_timeout,
+        skip_verified=args.skip_verified, delete_source=delete_source,
     )
     progress = Progress(total_files=len(files), total_bytes=total_bytes)
+    transferer.progress = progress
     bar = ProgressBar(progress, quota=quota)
 
+    interrupted = False
     try:
         if direction == "upload":
             _execute_simple(files, transferer.upload, args.workers, progress, bar)
@@ -1472,29 +2070,41 @@ def main() -> int:
                 stage_lifetime=args.stage_lifetime,
                 stage_poll=args.stage_poll,
                 stage_timeout=args.stage_timeout,
-                destage=not args.no_destage,
+                destage=(not args.no_destage) and (not delete_source),
             )
+    except KeyboardInterrupt:
+        interrupted = True
     finally:
+        bar.stop()
         bar.finish()
         if quota_poller:
             quota_poller.stop()
 
-    # ---- Summary ----
-    print_summary(progress, direction, quota=quota)
+    if interrupted:
+        LOG.warning("interrupted")
 
+    # ---- Summary ----
+    print_summary(progress, direction, quota=quota, interrupted=interrupted)
+
+    if interrupted:
+        return 130
     return 1 if progress.failed else 0
 
 
-def entry_point():
-    """Console-script entry point."""
+def _run_entry_point(*, prog: str, delete_source: bool) -> None:
     try:
-        raise SystemExit(main())
+        raise SystemExit(main(prog=prog, delete_source=delete_source))
     except KeyboardInterrupt:
         LOG.warning("interrupted")
         raise SystemExit(130)
     except (FileNotFoundError, ValueError) as exc:
         LOG.error("%s", exc)
         raise SystemExit(1)
+
+
+def entry_point():
+    """Console-script entry point."""
+    _run_entry_point(prog="dcache_cp", delete_source=False)
 
 
 if __name__ == "__main__":
