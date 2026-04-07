@@ -49,49 +49,96 @@ LOG = logging.getLogger("dcache_cp")
 
 DEFAULT_COPY_TIMEOUT = "300m"
 DEFAULT_CHECKSUM_TIMEOUT = 4 * 3600  # 4 h — TB-class files can take hours
+DEFAULT_STAGE_TIMEOUT = 86400  # 24 h
+DEFAULT_STAGE_POLL = 60  # seconds
+DEFAULT_STAGE_BATCH = 50  # files staged at a time
+DEFAULT_PROGRESS_FILE_OVERHEAD = 5 * 1024 * 1024  # weighted progress penalty per file
+MACAROON_DIR = Path("~/macaroons").expanduser()
 
-            src_prefix, src_path = parse_remote_prefix(src_raw)
-            dst_prefix, dst_path = parse_remote_prefix(dst_raw)
+_ADA_URL = (
+    "https://raw.githubusercontent.com/sara-nl/SpiderScripts"
+    "/refs/heads/master/ada/ada"
+)
+_ADA_CACHE = Path("~/.local/share/dcache_cp/ada").expanduser()
+_ADA_STAMP = Path("~/.local/share/dcache_cp/.ada_checked").expanduser()
+_ADA_CHECK_INTERVAL = 86400  # seconds — recheck GitHub once per day
 
-            if src_prefix and dst_prefix:
-                raise ValueError(f"{path}:{lineno}: both columns have a remote prefix")
-            if not src_prefix and not dst_prefix:
-                raise ValueError(f"{path}:{lineno}: neither column has a remote prefix")
 
-            row_dir = "download" if src_prefix else "upload"
-            row_prefix = src_prefix or dst_prefix
+def _update_ada() -> None:
+    """Download ada from GitHub, replacing the cache only if the content changed."""
+    try:
+        with urllib.request.urlopen(_ADA_URL, timeout=10) as resp:
+            data = resp.read()
+    except Exception as exc:
+        LOG.debug("Could not fetch ada from GitHub: %s", exc)
+        return
 
-            if direction is None:
-                direction = row_dir
-            elif row_dir != direction:
-                raise ValueError(
-                    f"{path}:{lineno}: mixed directions; first row was {direction}, "
-                    f"this row is {row_dir}"
-                )
+    if _ADA_CACHE.exists():
+        if hashlib.sha256(_ADA_CACHE.read_bytes()).digest() == hashlib.sha256(data).digest():
+            _ADA_STAMP.touch()
+            return
+        LOG.info("Updating ada from GitHub")
+    else:
+        LOG.info("Downloading ada from GitHub to %s", _ADA_CACHE)
 
-            if row_dir == "upload":
-                local = Path(src_path).expanduser().resolve()
-                if not local.is_file():
-                    raise FileNotFoundError(f"{path}:{lineno}: local file not found: {local}")
-                st = local.stat()
-                entries.append({
-                    "source": local,
-                    "resolved_source": local,
-                    "rel": local.name,
-                    "size": st.st_size,
-                    "remote_path": dst_path.strip("/"),
-                    "_prefix": row_prefix,
-                })
-            else:
-                remote_p = src_path.strip("/")
-                local_p = Path(dst_path).expanduser().resolve()
-                entries.append({
-                    "remote_path": remote_p,
-                    "local_path": local_p,
-                    "rel": posixpath.basename(remote_p),
-                    "size": 0,  # resolved after config/remote selection
-                    "_prefix": row_prefix,
-                })
+    _ADA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    _ADA_CACHE.write_bytes(data)
+    _ADA_CACHE.chmod(0o755)
+    _ADA_STAMP.touch()
+
+
+def _default_ada() -> str:
+    """Return path to ada: $ADA env var, or a cached copy kept fresh from GitHub."""
+    env = os.environ.get("ADA")
+    if env:
+        return env
+
+    needs_check = not _ADA_CACHE.exists() or (
+        not _ADA_STAMP.exists()
+        or (time.time() - _ADA_STAMP.stat().st_mtime) > _ADA_CHECK_INTERVAL
+    )
+    if needs_check:
+        _update_ada()
+
+    return str(_ADA_CACHE) if _ADA_CACHE.is_file() else "ada"
+
+
+_SNELLIUS_WORK_GLOBS = ["/gpfs/work*/0"]
+_SPIDER_PROJECT_DIR = Path("/project")
+
+DEFAULT_RCLONE_CONFIG_CANDIDATES = [
+    Path("~/config/rclone/rclone.conf"),
+    Path("~/.config/rclone/rclone.conf"),
+]
+
+
+class _C:
+    """ANSI escape sequences.  Call ``_C.init(stream)`` once to enable/disable."""
+    RESET = BOLD = DIM = ""
+    RED = GREEN = YELLOW = BLUE = CYAN = MAGENTA = WHITE = ""
+    BG_GREEN = BG_RED = BG_BLUE = BG_YELLOW = ""
+
+    @classmethod
+    def init(cls, stream=None):
+        stream = stream or sys.stderr
+        if hasattr(stream, "isatty") and stream.isatty() and os.environ.get("NO_COLOR") is None:
+            cls.RESET = "\033[0m"
+            cls.BOLD = "\033[1m"
+            cls.DIM = "\033[2m"
+            cls.RED = "\033[31m"
+            cls.GREEN = "\033[32m"
+            cls.YELLOW = "\033[33m"
+            cls.BLUE = "\033[34m"
+            cls.MAGENTA = "\033[35m"
+            cls.CYAN = "\033[36m"
+            cls.WHITE = "\033[37m"
+            cls.BG_GREEN = "\033[42m"
+            cls.BG_RED = "\033[41m"
+            cls.BG_BLUE = "\033[44m"
+            cls.BG_YELLOW = "\033[43m"
+
+
+def setup_logging(verbose: bool):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -1009,13 +1056,15 @@ class _EnumSpinner:
 class Progress:
     _SPEED_WINDOW = 30.0  # seconds for rolling speed average
 
-    def __init__(self, total_files: int, total_bytes: int):
+    def __init__(self, total_files: int, total_bytes: int, file_overhead: int = DEFAULT_PROGRESS_FILE_OVERHEAD):
         self.total_files = total_files
         self.total_bytes = total_bytes
+        self.file_overhead = file_overhead
         self.validated_files = 0
         self.validated_bytes = 0
         self.skipped_files = 0
         self.skipped_bytes = 0
+        self.failed_bytes = 0
         self.total_retries = 0
         self.failed: list[tuple[str, str]] = []
         self.lock = threading.Lock()
@@ -1042,10 +1091,27 @@ class Progress:
                 self.total_retries += attempts - 1
             return self.validated_files, self.validated_bytes
 
-    def failure(self, rel: str, exc: Exception):
+    def failure(self, rel: str, size: int, exc: Exception):
         with self.lock:
+            self.failed_bytes += size
             self.failed.append((rel, str(exc)))
             return len(self.failed)
+
+    @property
+    def total_progress_units(self) -> int:
+        return self.total_bytes + self.total_files * self.file_overhead
+
+    @property
+    def completed_progress_units(self) -> int:
+        completed_files = self.validated_files + len(self.failed)
+        return self.validated_bytes + self.failed_bytes + completed_files * self.file_overhead
+
+    @property
+    def progress_fraction(self) -> float:
+        total_units = self.total_progress_units
+        if total_units <= 0:
+            return 1.0
+        return min(self.completed_progress_units / total_units, 1.0)
 
     def speed_bps(self) -> float | None:
         """Rolling average bytes/s over the last SPEED_WINDOW seconds."""
@@ -1098,7 +1164,7 @@ class ProgressBar:
             p = self.progress
             total = p.total_files
             done = p.done
-            pct = done / total if total else 1.0
+            pct = p.progress_fraction
             filled = int(self.BAR_WIDTH * pct)
             bar_fill = f"{_C.BG_GREEN}{_C.WHITE}" + " " * filled + f"{_C.RESET}"
             bar_empty = f"{_C.DIM}" + "\u2591" * (self.BAR_WIDTH - filled) + f"{_C.RESET}"
@@ -1424,28 +1490,43 @@ class Transferer:
             # Fetch remote checksum (may wait for dCache to compute it).
             # Compute local hash concurrently in a thread so we don't add
             # extra wall-clock time on top of the checksum wait.
-            if local_adler is None:
-                if self.progress:
-                    self.progress.status = f"hashing {local_path.name}"
-                wait_for_local_adler = _run_in_daemon_thread(
-                    adler32_local,
-                    local_path,
-                    name=f"hash-{local_path.name}",
-                )
-                if self.progress:
-                    self.progress.status = f"waiting checksum {local_path.name}"
-                try:
-                    remote_adler = self._remote_adler(remote_path)
-                    local_adler = wait_for_local_adler()
-                finally:
+            try:
+                if local_adler is None:
                     if self.progress:
-                        self.progress.status = ""
-            else:
-                if self.progress:
-                    self.progress.status = f"waiting checksum {local_path.name}"
-                remote_adler = self._remote_adler(remote_path)
-                if self.progress:
-                    self.progress.status = ""
+                        self.progress.status = f"hashing {local_path.name}"
+                    wait_for_local_adler = _run_in_daemon_thread(
+                        adler32_local,
+                        local_path,
+                        name=f"hash-{local_path.name}",
+                    )
+                    if self.progress:
+                        self.progress.status = f"waiting checksum {local_path.name}"
+                    try:
+                        remote_adler = self._remote_adler(remote_path)
+                        local_adler = wait_for_local_adler()
+                    finally:
+                        if self.progress:
+                            self.progress.status = ""
+                else:
+                    if self.progress:
+                        self.progress.status = f"waiting checksum {local_path.name}"
+                    try:
+                        remote_adler = self._remote_adler(remote_path)
+                    finally:
+                        if self.progress:
+                            self.progress.status = ""
+            except Exception as exc:
+                LOG.warning("verification failed %s: %s (attempt %d/%d)",
+                            rel, exc, attempt + 1, self.max_retries + 1)
+                try:
+                    self._rclone_deletefile(f"{self.remote}:{remote_path}")
+                except Exception as delete_exc:
+                    LOG.debug("cleanup after verification failure for %s failed: %s", rel, delete_exc)
+                local_adler = None
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_wait)
+                    continue
+                raise RuntimeError(f"verification failed for {rel}: {exc}") from exc
 
             if normalize_adler(local_adler) == normalize_adler(remote_adler):
                 self._delete_uploaded_source(entry)
@@ -1481,8 +1562,17 @@ class Transferer:
         for attempt in range(self.max_retries + 1):
             local_path.parent.mkdir(parents=True, exist_ok=True)
             self._rclone_copyto(f"{self.remote}:{remote_path}", str(local_path))
-            remote_adler = self._remote_adler(remote_path)
-            local_adler = adler32_local(local_path)
+            try:
+                remote_adler = self._remote_adler(remote_path)
+                local_adler = adler32_local(local_path)
+            except Exception as exc:
+                LOG.warning("verification failed %s: %s (attempt %d/%d)",
+                            rel, exc, attempt + 1, self.max_retries + 1)
+                local_path.unlink(missing_ok=True)
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_wait)
+                    continue
+                raise RuntimeError(f"verification failed for {rel}: {exc}") from exc
             if normalize_adler(local_adler) == normalize_adler(remote_adler):
                 self._delete_downloaded_source(remote_path)
                 return self._dl_result(rel, remote_path, local_path, size, local_adler, remote_adler, attempt + 1, False)
@@ -1634,7 +1724,7 @@ def _execute_simple(
 
 
 def _handle_failed_result(entry: dict, exc: BaseException, progress: Progress, bar: ProgressBar):
-    progress.failure(entry["rel"], exc)
+    progress.failure(entry["rel"], entry.get("size", 0), exc)
     bar.finish()
     LOG.error("%s\u2718%s %s: %s", _C.RED, _C.RESET, entry["rel"], exc)
     bar.update(entry["rel"])
