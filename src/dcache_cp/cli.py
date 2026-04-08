@@ -59,13 +59,38 @@ _ADA_URL = (
     "https://raw.githubusercontent.com/sara-nl/SpiderScripts"
     "/refs/heads/master/ada/ada"
 )
-_ADA_CACHE = Path("~/.local/share/dcache_cp/ada").expanduser()
-_ADA_STAMP = Path("~/.local/share/dcache_cp/.ada_checked").expanduser()
 _ADA_CHECK_INTERVAL = 86400  # seconds — recheck GitHub once per day
+
+# Candidate directories for caching ada, tried in order.
+_ADA_CACHE_DIRS = [
+    Path("~/.local/share/dcache_cp").expanduser(),
+    Path(os.environ.get("TMPDIR", "/tmp")) / f"dcache_cp_{os.getenv('USER', 'user')}",
+    Path.cwd() / ".dcache_cp",
+]
+
+
+def _ada_cache_path() -> Path | None:
+    """Return the first writable candidate dir, creating it if needed."""
+    for d in _ADA_CACHE_DIRS:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            # Quick write-test
+            test = d / ".write_test"
+            test.write_bytes(b"")
+            test.unlink()
+            return d
+        except OSError:
+            continue
+    return None
 
 
 def _update_ada() -> None:
-    """Download ada from GitHub, replacing the cache only if the content changed."""
+    """Download ada from GitHub into the first writable cache location."""
+    cache_dir = _ada_cache_path()
+    if cache_dir is None:
+        LOG.debug("No writable location found to cache ada; skipping download")
+        return
+
     try:
         with urllib.request.urlopen(_ADA_URL, timeout=10) as resp:
             data = resp.read()
@@ -73,18 +98,43 @@ def _update_ada() -> None:
         LOG.debug("Could not fetch ada from GitHub: %s", exc)
         return
 
-    if _ADA_CACHE.exists():
-        if hashlib.sha256(_ADA_CACHE.read_bytes()).digest() == hashlib.sha256(data).digest():
-            _ADA_STAMP.touch()
-            return
-        LOG.info("Updating ada from GitHub")
-    else:
-        LOG.info("Downloading ada from GitHub to %s", _ADA_CACHE)
+    cache = cache_dir / "ada"
+    stamp = cache_dir / ".ada_checked"
 
-    _ADA_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    _ADA_CACHE.write_bytes(data)
-    _ADA_CACHE.chmod(0o755)
-    _ADA_STAMP.touch()
+    if cache.exists():
+        if hashlib.sha256(cache.read_bytes()).digest() == hashlib.sha256(data).digest():
+            try:
+                stamp.touch()
+            except OSError:
+                pass
+            return
+        LOG.info("Updating ada from GitHub (%s)", cache)
+    else:
+        LOG.info("Downloading ada from GitHub to %s", cache)
+
+    try:
+        cache.write_bytes(data)
+        cache.chmod(0o755)
+        stamp.touch()
+    except OSError as exc:
+        LOG.debug("Could not write ada cache to %s: %s", cache, exc)
+
+
+def _find_ada_cache() -> Path | None:
+    """Return the cached ada binary from the first candidate dir that has it."""
+    for d in _ADA_CACHE_DIRS:
+        p = d / "ada"
+        if p.is_file():
+            return p
+    return None
+
+
+def _needs_update() -> bool:
+    for d in _ADA_CACHE_DIRS:
+        stamp = d / ".ada_checked"
+        if stamp.exists():
+            return (time.time() - stamp.stat().st_mtime) > _ADA_CHECK_INTERVAL
+    return True  # no stamp found anywhere → update
 
 
 def _default_ada() -> str:
@@ -93,14 +143,12 @@ def _default_ada() -> str:
     if env:
         return env
 
-    needs_check = not _ADA_CACHE.exists() or (
-        not _ADA_STAMP.exists()
-        or (time.time() - _ADA_STAMP.stat().st_mtime) > _ADA_CHECK_INTERVAL
-    )
-    if needs_check:
+    cached = _find_ada_cache()
+    if cached is None or _needs_update():
         _update_ada()
+        cached = _find_ada_cache()
 
-    return str(_ADA_CACHE) if _ADA_CACHE.is_file() else "ada"
+    return str(cached) if cached else "ada"
 
 
 _SNELLIUS_WORK_GLOBS = ["/gpfs/work*/0"]
