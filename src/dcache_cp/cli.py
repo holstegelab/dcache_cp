@@ -69,28 +69,8 @@ _ADA_CACHE_DIRS = [
 ]
 
 
-def _ada_cache_path() -> Path | None:
-    """Return the first writable candidate dir, creating it if needed."""
-    for d in _ADA_CACHE_DIRS:
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-            # Quick write-test
-            test = d / ".write_test"
-            test.write_bytes(b"")
-            test.unlink()
-            return d
-        except OSError:
-            continue
-    return None
-
-
 def _update_ada() -> None:
-    """Download ada from GitHub into the first writable cache location."""
-    cache_dir = _ada_cache_path()
-    if cache_dir is None:
-        LOG.debug("No writable location found to cache ada; skipping download")
-        return
-
+    """Download ada from GitHub into the first candidate dir where it fits."""
     try:
         with urllib.request.urlopen(_ADA_URL, timeout=10) as resp:
             data = resp.read()
@@ -98,34 +78,54 @@ def _update_ada() -> None:
         LOG.debug("Could not fetch ada from GitHub: %s", exc)
         return
 
-    cache = cache_dir / "ada"
-    stamp = cache_dir / ".ada_checked"
+    for d in _ADA_CACHE_DIRS:
+        cache = d / "ada"
+        stamp = d / ".ada_checked"
 
-    if cache.exists():
-        if hashlib.sha256(cache.read_bytes()).digest() == hashlib.sha256(data).digest():
+        # If already cached and up-to-date, just refresh the stamp.
+        if cache.is_file() and cache.stat().st_size > 0:
+            if hashlib.sha256(cache.read_bytes()).digest() == hashlib.sha256(data).digest():
+                try:
+                    stamp.touch()
+                except OSError:
+                    pass
+                return
+            LOG.info("Updating ada from GitHub (%s)", cache)
+        else:
+            LOG.info("Downloading ada from GitHub to %s", cache)
+
+        # Write via a temp file so a failed write never leaves a 0-byte ada.
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / ".ada_tmp"
+            tmp.write_bytes(data)   # raises OSError on quota
+            tmp.chmod(0o755)
+            tmp.replace(cache)      # atomic rename
             try:
                 stamp.touch()
             except OSError:
                 pass
-            return
-        LOG.info("Updating ada from GitHub (%s)", cache)
-    else:
-        LOG.info("Downloading ada from GitHub to %s", cache)
+            return                  # success — stop trying candidates
+        except OSError as exc:
+            LOG.debug("Could not write ada to %s: %s", cache, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # Try next candidate dir.
 
-    try:
-        cache.write_bytes(data)
-        cache.chmod(0o755)
-        stamp.touch()
-    except OSError as exc:
-        LOG.debug("Could not write ada cache to %s: %s", cache, exc)
+    LOG.debug("No writable location found to cache ada; will use system ada")
 
 
 def _find_ada_cache() -> Path | None:
-    """Return the cached ada binary from the first candidate dir that has it."""
+    """Return a valid cached ada binary: non-empty and executable."""
     for d in _ADA_CACHE_DIRS:
         p = d / "ada"
-        if p.is_file():
-            return p
+        try:
+            if p.is_file() and p.stat().st_size > 0 and os.access(p, os.X_OK):
+                return p
+        except OSError:
+            continue
     return None
 
 
