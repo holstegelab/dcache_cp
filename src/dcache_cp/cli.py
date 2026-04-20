@@ -32,6 +32,8 @@ import logging
 import os
 import posixpath
 import queue
+import random
+import re
 import shlex
 import subprocess
 import sys
@@ -39,6 +41,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from pathlib import Path
@@ -51,7 +54,10 @@ DEFAULT_COPY_TIMEOUT = "300m"
 DEFAULT_CHECKSUM_TIMEOUT = 4 * 3600  # 4 h — TB-class files can take hours
 DEFAULT_STAGE_TIMEOUT = 86400  # 24 h
 DEFAULT_STAGE_POLL = 60  # seconds
-DEFAULT_STAGE_BATCH = 50  # files staged at a time
+DEFAULT_STAGE_BATCH = 10000  # files staged at a time
+DEFAULT_STAGE_BATCH_BYTES = 5 * 1024 ** 4  # 5 TiB staged at a time
+DEFAULT_STAGE_FALLBACK_WORKERS = 4  # concurrent WebDAV range reads when ada staging fails
+DEFAULT_STAGE_FALLBACK_MAX_TIME = 1  # seconds to wait for the 1-byte WebDAV priming read
 DEFAULT_PROGRESS_FILE_OVERHEAD = 5 * 1024 * 1024  # weighted progress penalty per file
 MACAROON_DIR = Path("~/macaroons").expanduser()
 
@@ -98,21 +104,20 @@ def _update_ada() -> None:
         try:
             d.mkdir(parents=True, exist_ok=True)
             tmp = d / ".ada_tmp"
-            tmp.write_bytes(data)   # raises OSError on quota
+            tmp.write_bytes(data)
             tmp.chmod(0o755)
-            tmp.replace(cache)      # atomic rename
+            tmp.replace(cache)
             try:
                 stamp.touch()
             except OSError:
                 pass
-            return                  # success — stop trying candidates
+            return
         except OSError as exc:
             LOG.debug("Could not write ada to %s: %s", cache, exc)
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
-            # Try next candidate dir.
 
     LOG.debug("No writable location found to cache ada; will use system ada")
 
@@ -134,7 +139,7 @@ def _needs_update() -> bool:
         stamp = d / ".ada_checked"
         if stamp.exists():
             return (time.time() - stamp.stat().st_mtime) > _ADA_CHECK_INTERVAL
-    return True  # no stamp found anywhere → update
+    return True
 
 
 def _default_ada() -> str:
@@ -163,7 +168,7 @@ DEFAULT_RCLONE_CONFIG_CANDIDATES = [
 class _C:
     """ANSI escape sequences.  Call ``_C.init(stream)`` once to enable/disable."""
     RESET = BOLD = DIM = ""
-    RED = GREEN = YELLOW = BLUE = CYAN = MAGENTA = WHITE = ""
+    RED = GREEN = YELLOW = BLUE = CYAN = MAGENTA = WHITE = GRAY = ""
     BG_GREEN = BG_RED = BG_BLUE = BG_YELLOW = ""
 
     @classmethod
@@ -180,6 +185,7 @@ class _C:
             cls.MAGENTA = "\033[35m"
             cls.CYAN = "\033[36m"
             cls.WHITE = "\033[37m"
+            cls.GRAY = "\033[90m"
             cls.BG_GREEN = "\033[42m"
             cls.BG_RED = "\033[41m"
             cls.BG_BLUE = "\033[44m"
@@ -417,6 +423,26 @@ def _parse_adler32(output: str) -> str | None:
             if part.lower().startswith("adler32="):
                 return part.split("=", 1)[1]
     return None
+
+
+_ADA_REQUEST_ID_RE = re.compile(r"\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b")
+
+
+def _extract_ada_request_ids(output: str) -> list[str]:
+    seen: set[str] = set()
+    request_ids: list[str] = []
+    for match in _ADA_REQUEST_ID_RE.finditer(output or ""):
+        request_id = match.group(1)
+        if request_id not in seen:
+            seen.add(request_id)
+            request_ids.append(request_id)
+    return request_ids
+
+
+def _redact_http_secrets(text: str) -> str:
+    redacted = re.sub(r"(?i)(authz=)([^&\s]+)", r"\1<redacted>", text)
+    redacted = re.sub(r"(?i)(authorization:\s*bearer\s+)(\S+)", r"\1<redacted>", redacted)
+    return redacted
 
 
 def _ada_reports_missing_path(output: str) -> bool:
@@ -1102,7 +1128,7 @@ class _EnumSpinner:
 # ---------------------------------------------------------------------------
 
 class Progress:
-    _SPEED_WINDOW = 30.0  # seconds for rolling speed average
+    _SPEED_WINDOW = 300.0  # seconds for rolling speed average
 
     def __init__(self, total_files: int, total_bytes: int, file_overhead: int = DEFAULT_PROGRESS_FILE_OVERHEAD):
         self.total_files = total_files
@@ -1118,32 +1144,118 @@ class Progress:
         self.lock = threading.Lock()
         self.start_time = time.monotonic()
         self.status = ""  # current per-worker activity shown in the bar
-        # Rolling window: list of (timestamp, bytes) for speed calculation
-        self._speed_samples: list[tuple[float, int]] = []
+        self.requested_files = 0
+        self.requested_bytes = 0
+        self.online_files = 0
+        self.online_bytes = 0
+        self._stage_states: dict[str, tuple[str, int]] = {}
+        self._has_stage_activity = False
+        # Rolling window of cumulative transferred bytes sampled on each bar refresh.
+        self._speed_observations: list[tuple[float, int]] = []
 
-    def success(self, rel: str, size: int, attempts: int = 1, skipped: bool = False):
+    def _add_stage_bucket(self, state: str, size: int):
+        if state == "requested":
+            self.requested_files += 1
+            self.requested_bytes += size
+        elif state == "online":
+            self.online_files += 1
+            self.online_bytes += size
+
+    def _remove_stage_bucket(self, state: str, size: int):
+        if state == "requested":
+            self.requested_files = max(0, self.requested_files - 1)
+            self.requested_bytes = max(0, self.requested_bytes - size)
+        elif state == "online":
+            self.online_files = max(0, self.online_files - 1)
+            self.online_bytes = max(0, self.online_bytes - size)
+
+    def _set_stage_state(self, key: str, size: int, new_state: str | None) -> bool:
+        normalized_size = max(int(size), 0)
+        previous = self._stage_states.get(key)
+        if previous is not None:
+            old_state, old_size = previous
+            if old_state == new_state and old_size == normalized_size:
+                return False
+            self._remove_stage_bucket(old_state, old_size)
+            del self._stage_states[key]
+        if new_state is None:
+            return previous is not None
+        self._has_stage_activity = True
+        self._stage_states[key] = (new_state, normalized_size)
+        self._add_stage_bucket(new_state, normalized_size)
+        return True
+
+    def mark_stage_requested(self, key: str, size: int):
         with self.lock:
+            return self._set_stage_state(key, size, "requested")
+
+    def mark_stage_online(self, key: str, size: int):
+        with self.lock:
+            return self._set_stage_state(key, size, "online")
+
+    def clear_stage_state(self, key: str, size: int = 0):
+        with self.lock:
+            return self._set_stage_state(key, size, None)
+
+    def clear_stage_states(self, entries: list[tuple[str, int]]):
+        with self.lock:
+            for key, size in entries:
+                self._set_stage_state(key, size, None)
+
+    def success(self, rel: str, size: int, attempts: int = 1, skipped: bool = False, stage_key: str | None = None):
+        with self.lock:
+            if stage_key:
+                self._set_stage_state(stage_key, size, None)
             self.validated_files += 1
             self.validated_bytes += size
             if skipped:
                 self.skipped_files += 1
                 self.skipped_bytes += size
-            else:
-                now = time.monotonic()
-                self._speed_samples.append((now, size))
-                # Trim samples outside the window
-                cutoff = now - self._SPEED_WINDOW
-                while self._speed_samples and self._speed_samples[0][0] < cutoff:
-                    self._speed_samples.pop(0)
             if attempts > 1:
                 self.total_retries += attempts - 1
             return self.validated_files, self.validated_bytes
 
-    def failure(self, rel: str, size: int, exc: Exception):
+    def failure(self, rel: str, size: int, exc: Exception, stage_key: str | None = None):
         with self.lock:
+            if stage_key:
+                self._set_stage_state(stage_key, size, None)
             self.failed_bytes += size
             self.failed.append((rel, str(exc)))
             return len(self.failed)
+
+    @staticmethod
+    def _units_for(files: int, size: int, file_overhead: int) -> int:
+        return max(int(size), 0) + max(int(files), 0) * file_overhead
+
+    def snapshot(self) -> dict[str, int | float | bool | str]:
+        with self.lock:
+            failed_files = len(self.failed)
+            total_units = self.total_bytes + self.total_files * self.file_overhead
+            validated_units = self._units_for(self.validated_files, self.validated_bytes, self.file_overhead)
+            failed_units = self._units_for(failed_files, self.failed_bytes, self.file_overhead)
+            online_units = self._units_for(self.online_files, self.online_bytes, self.file_overhead)
+            requested_units = self._units_for(self.requested_files, self.requested_bytes, self.file_overhead)
+            completed_units = validated_units + failed_units
+            return {
+                "total_files": self.total_files,
+                "total_bytes": self.total_bytes,
+                "total_units": total_units,
+                "done_files": self.validated_files + failed_files,
+                "validated_files": self.validated_files,
+                "validated_bytes": self.validated_bytes,
+                "failed_files": failed_files,
+                "failed_units": failed_units,
+                "online_files": self.online_files,
+                "online_units": online_units,
+                "requested_files": self.requested_files,
+                "requested_units": requested_units,
+                "completed_units": completed_units,
+                "progress_fraction": min(completed_units / total_units, 1.0) if total_units > 0 else 1.0,
+                "status": self.status,
+                "start_time": self.start_time,
+                "has_stage_activity": self._has_stage_activity,
+                "error_count": failed_files,
+            }
 
     @property
     def total_progress_units(self) -> int:
@@ -1161,20 +1273,31 @@ class Progress:
             return 1.0
         return min(self.completed_progress_units / total_units, 1.0)
 
+    def observe_speed(self, now: float | None = None) -> None:
+        """Record the current total transferred bytes for rolling speed estimation."""
+        timestamp = now if now is not None else time.monotonic()
+        with self.lock:
+            transferred_bytes = max(self.validated_bytes - self.skipped_bytes, 0)
+            if self._speed_observations and self._speed_observations[-1][1] == transferred_bytes:
+                self._speed_observations[-1] = (timestamp, transferred_bytes)
+            else:
+                self._speed_observations.append((timestamp, transferred_bytes))
+
+            cutoff = timestamp - self._SPEED_WINDOW
+            while len(self._speed_observations) > 1 and self._speed_observations[0][0] < cutoff:
+                self._speed_observations.pop(0)
+
     def speed_bps(self) -> float | None:
         """Rolling average bytes/s over the last SPEED_WINDOW seconds."""
         with self.lock:
-            if len(self._speed_samples) < 2:
+            if len(self._speed_observations) < 2:
                 return None
-            now = time.monotonic()
-            cutoff = now - self._SPEED_WINDOW
-            samples = [(t, b) for t, b in self._speed_samples if t >= cutoff]
-            if len(samples) < 2:
-                return None
-            window = samples[-1][0] - samples[0][0]
+            first_time, first_bytes = self._speed_observations[0]
+            last_time, last_bytes = self._speed_observations[-1]
+            window = last_time - first_time
             if window <= 0:
                 return None
-            return sum(b for _, b in samples) / window
+            return max(last_bytes - first_bytes, 0) / window
 
     @property
     def done(self) -> int:
@@ -1205,36 +1328,86 @@ class ProgressBar:
     def stop(self):
         self._stop.set()
 
+    @staticmethod
+    def _allocate_widths(units: list[int], width: int) -> list[int]:
+        total_units = sum(units)
+        if width <= 0:
+            return [0] * len(units)
+        if total_units <= 0:
+            widths = [0] * len(units)
+            widths[-1] = width
+            return widths
+        raw_widths = [(unit * width) / total_units for unit in units]
+        widths = [int(raw) for raw in raw_widths]
+        remaining = width - sum(widths)
+        order = sorted(
+            range(len(units)),
+            key=lambda idx: raw_widths[idx] - widths[idx],
+            reverse=True,
+        )
+        for idx in order[:remaining]:
+            widths[idx] += 1
+        return widths
+
+    def _render_bar(self, snap: dict[str, int | float | bool | str]) -> str:
+        total_units = int(snap["total_units"])
+        validated_units = int(snap["completed_units"]) - int(snap["failed_units"])
+        failed_units = int(snap["failed_units"])
+        online_units = int(snap["online_units"])
+        requested_units = int(snap["requested_units"])
+        used_units = min(total_units, validated_units + failed_units + online_units + requested_units)
+        empty_units = max(total_units - used_units, 0)
+        widths = self._allocate_widths(
+            [validated_units, failed_units, online_units, requested_units, empty_units],
+            self.BAR_WIDTH,
+        )
+        segments = [
+            (_C.GREEN, "█", widths[0]),
+            (_C.RED, "█", widths[1]),
+            (_C.BLUE, "█", widths[2]),
+            (_C.GRAY, "█", widths[3]),
+            (_C.DIM, "░", widths[4]),
+        ]
+        parts: list[str] = []
+        for color, char, seg_width in segments:
+            if seg_width <= 0:
+                continue
+            parts.append(f"{color}{char * seg_width}{_C.RESET}")
+        return f"{_C.DIM}[{_C.RESET}{''.join(parts)}{_C.DIM}]{_C.RESET}"
+
     def update(self, last_file: str = ""):
         if not self._is_tty:
             return
         with self._lock:
-            p = self.progress
-            total = p.total_files
-            done = p.done
-            pct = p.progress_fraction
-            filled = int(self.BAR_WIDTH * pct)
-            bar_fill = f"{_C.BG_GREEN}{_C.WHITE}" + " " * filled + f"{_C.RESET}"
-            bar_empty = f"{_C.DIM}" + "\u2591" * (self.BAR_WIDTH - filled) + f"{_C.RESET}"
-            bar = bar_fill + bar_empty
-            elapsed = time.monotonic() - p.start_time
+            self.progress.observe_speed()
+            snap = self.progress.snapshot()
+            total = int(snap["total_files"])
+            done = int(snap["done_files"])
+            pct = float(snap["progress_fraction"])
+            bar = self._render_bar(snap)
+            elapsed = time.monotonic() - float(snap["start_time"])
             elapsed_str = fmt_duration(elapsed)
             eta_str = fmt_duration(elapsed / pct - elapsed) if 0 < pct < 1.0 else "--:--"
             pct_str = f"{_C.BOLD}{_C.GREEN}{pct * 100:5.1f}%{_C.RESET}"
             files_str = f"{_C.CYAN}{done}{_C.RESET}/{total}"
             bytes_str = (
-                f"{_C.CYAN}{format_bytes(p.validated_bytes)}{_C.RESET}"
-                f"/{format_bytes(p.total_bytes)}"
+                f"{_C.CYAN}{format_bytes(int(snap['validated_bytes']))}{_C.RESET}"
+                f"/{format_bytes(int(snap['total_bytes']))}"
             )
             time_str = f"{_C.DIM}{elapsed_str}<{eta_str}{_C.RESET}"
-            speed = p.speed_bps()
+            speed = self.progress.speed_bps()
             speed_str = f"  {_C.CYAN}{format_bytes(int(speed))}/s{_C.RESET}" if speed else ""
             err = ""
-            if p.failed:
-                err = f"  {_C.RED}{_C.BOLD}err:{len(p.failed)}{_C.RESET}"
+            if int(snap["error_count"]):
+                err = f"  {_C.RED}{_C.BOLD}err:{int(snap['error_count'])}{_C.RESET}"
             line = f"  {bar} {pct_str}  {files_str} files  {bytes_str}  {time_str}{speed_str}{err}"
+            if bool(snap["has_stage_activity"]):
+                line += (
+                    f"  {_C.BLUE}on:{int(snap['online_files'])}{_C.RESET}"
+                    f" {_C.GRAY}stg:{int(snap['requested_files'])}{_C.RESET}"
+                )
             # Always show hashing status when active; fall back to quota or last filename.
-            status = p.status or last_file
+            status = str(snap["status"]) or last_file
             if status:
                 mx = 35
                 display = status if len(status) <= mx else "..." + status[-(mx - 3):]
@@ -1329,10 +1502,20 @@ def print_summary(
 class StageManager:
     """Bulk stage / poll / destage via the ``ada`` CLI."""
 
-    def __init__(self, ada_cmd: str, tokenfile: Path, api: str | None):
+    def __init__(
+        self,
+        ada_cmd: str,
+        tokenfile: Path,
+        api: str | None,
+        remote_cfg: configparser.SectionProxy | None = None,
+    ):
         self.ada_cmd = ada_cmd
         self.tokenfile = tokenfile
         self.api = api
+        self.webdav_url = remote_cfg.get("url", fallback=None) if remote_cfg else None
+        self.webdav_bearer_token = remote_cfg.get("bearer_token", fallback=None) if remote_cfg else None
+        self.webdav_bearer_token_command = remote_cfg.get("bearer_token_command", fallback=None) if remote_cfg else None
+        self._resolved_webdav_bearer_token = (self.webdav_bearer_token or "").strip() or None
 
     def _base_cmd(self) -> list[str]:
         cmd = [self.ada_cmd, "--tokenfile", str(self.tokenfile)]
@@ -1340,10 +1523,163 @@ class StageManager:
             cmd += ["--api", self.api]
         return cmd
 
-    def stage(self, remote_paths: list[str], lifetime: str = "7D"):
+    def can_prime_via_webdav_range(self) -> bool:
+        return bool(self.webdav_url and (self._resolved_webdav_bearer_token or self.webdav_bearer_token_command))
+
+    def _resolve_webdav_bearer_token(self) -> str | None:
+        if self._resolved_webdav_bearer_token:
+            return self._resolved_webdav_bearer_token
+        if not self.webdav_bearer_token_command:
+            return None
+        try:
+            cmd = shlex.split(self.webdav_bearer_token_command)
+            result = subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as exc:
+            LOG.warning("could not obtain WebDAV bearer token from configured command: %s", exc)
+            return None
+        token = ""
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped:
+                token = stripped
+        self._resolved_webdav_bearer_token = token or None
+        return self._resolved_webdav_bearer_token
+
+    def _webdav_file_url(self, remote_path: str) -> str:
+        if not self.webdav_url:
+            raise RuntimeError("WebDAV URL not configured for stage fallback")
+        parts = [urllib.parse.quote(part, safe="") for part in remote_path.strip("/").split("/") if part]
+        return self.webdav_url.rstrip("/") + "/" + "/".join(parts)
+
+    def prime_via_webdav_range(self, entry: dict) -> dict:
+        """Trigger dCache auto-staging through a 1-byte authenticated WebDAV read."""
+        remote_path = str(entry["remote_path"]).strip("/")
+        token = self._resolve_webdav_bearer_token()
+        if not token:
+            raise RuntimeError("no WebDAV bearer token available for staging fallback")
+
+        url = self._webdav_file_url(remote_path)
+        cmd = [
+            "curl",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            str(DEFAULT_STAGE_FALLBACK_MAX_TIME),
+            "--range",
+            "0-1",
+            "--dump-header",
+            "-",
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "\n%{http_code}",
+            "--header",
+            f"Authorization: Bearer {token}",
+            url,
+        ]
+        redacted_cmd = cmd[:-2] + ["--header", "Authorization: Bearer <redacted>", url]
+        redacted_cmd_text = shlex.join(redacted_cmd)
+        LOG.debug("webdav stage fallback command: %s", redacted_cmd_text)
+        attempt = 0
+        while True:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout_text = result.stdout.rstrip()
+            stdout_lines = stdout_text.splitlines() if stdout_text else []
+            http_code_text = stdout_lines[-1].strip() if stdout_lines else "000"
+            response_text = "\n".join(stdout_lines[:-1]).strip()
+            try:
+                http_code = int(http_code_text)
+            except ValueError:
+                http_code = 0
+
+            if http_code in {200, 206, 416}:
+                return {"remote_path": "/" + remote_path}
+
+            if result.returncode == 28:
+                return {"remote_path": "/" + remote_path, "timed_out": True}
+
+            detail_parts = []
+            if result.stderr.strip():
+                detail_parts.append(result.stderr.strip())
+            if response_text:
+                detail_parts.append(response_text)
+            detail_text = _redact_http_secrets("\n".join(part for part in detail_parts if part).strip())
+            detail_lines = detail_text.splitlines()
+            summary = detail_lines[0] if detail_lines else f"HTTP {http_code or 'unknown'}"
+
+            if http_code == 429 and attempt < 6:
+                wait = min(2 ** attempt, 8) + random.uniform(0, 0.5)
+                LOG.debug(
+                    "WebDAV range-read fallback rate-limited for %s; retrying in %.1fs\ncommand: %s\n%s",
+                    remote_path,
+                    wait,
+                    redacted_cmd_text,
+                    detail_text or "(no curl details)",
+                )
+                time.sleep(wait)
+                attempt += 1
+                continue
+
+            if http_code in {500, 502, 503, 504} and attempt < 4:
+                wait = min(2 ** attempt * 15, 120) + random.uniform(0, 5)
+                LOG.warning(
+                    "WebDAV range-read fallback got HTTP %d for %s; retrying in %.1fs\ncommand: %s\n%s",
+                    http_code,
+                    remote_path,
+                    wait,
+                    redacted_cmd_text,
+                    detail_text or "(no curl details)",
+                )
+                time.sleep(wait)
+                attempt += 1
+                continue
+
+            if result.returncode != 0 and http_code == 0 and attempt < 4:
+                wait = min(2 ** attempt * 10, 60) + random.uniform(0, 3)
+                LOG.warning(
+                    "WebDAV range-read fallback transport failure for %s; retrying in %.1fs\ncommand: %s\n%s",
+                    remote_path,
+                    wait,
+                    redacted_cmd_text,
+                    detail_text or "(no curl details)",
+                )
+                time.sleep(wait)
+                attempt += 1
+                continue
+
+            if not detail_text:
+                if http_code:
+                    detail_text = f"HTTP {http_code}"
+                else:
+                    detail_text = f"curl exit {result.returncode}"
+
+            if http_code:
+                raise RuntimeError(
+                    f"WebDAV range-read fallback failed for {remote_path}: HTTP {http_code}; "
+                    f"curl exit {result.returncode}; command: {redacted_cmd_text}; details: {detail_text}"
+                )
+            raise RuntimeError(
+                f"WebDAV range-read fallback failed for {remote_path}: curl exit {result.returncode}; "
+                f"command: {redacted_cmd_text}; details: {detail_text}"
+            )
+
+    def stage(self, remote_paths: list[str], lifetime: str = "7D") -> list[str]:
         """Issue a bulk stage request using ``ada --stage --from-file``."""
         if not remote_paths:
-            return
+            return []
         LOG.info("staging %d file(s) (lifetime %s) ...", len(remote_paths), lifetime)
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
             for p in remote_paths:
@@ -1351,7 +1687,14 @@ class StageManager:
             list_file = fh.name
         try:
             cmd = self._base_cmd() + ["--stage", "--from-file", list_file, "--lifetime", lifetime]
-            run_command(cmd)
+            LOG.debug("stage command: %s", shlex.join(cmd))
+            result = run_command(cmd)
+            request_ids = _extract_ada_request_ids((result.stdout or "") + "\n" + (result.stderr or ""))
+            if request_ids:
+                LOG.info("stage request id(s): %s", ", ".join(request_ids))
+            else:
+                LOG.debug("no stage request id found in ada output")
+            return request_ids
         finally:
             os.unlink(list_file)
 
@@ -1359,29 +1702,153 @@ class StageManager:
         """Release pins via ``ada --unstage --from-file``."""
         if not remote_paths:
             return
-        LOG.info("releasing pins for %d file(s) ...", len(remote_paths))
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
             for p in remote_paths:
                 fh.write("/" + p.strip("/") + "\n")
             list_file = fh.name
         try:
             cmd = self._base_cmd() + ["--unstage", "--from-file", list_file]
+            LOG.debug("unstage command: %s", shlex.join(cmd))
             run_command(cmd)
         finally:
             os.unlink(list_file)
 
-    def is_online(self, remote_path: str) -> bool:
-        """Check file locality via ``ada --stat``."""
+    def _stat_json(self, remote_path: str) -> tuple[dict | None, str | None]:
+        """Return parsed ``ada --stat`` JSON for a path, or an error string."""
         cmd = self._base_cmd() + ["--stat", "/" + remote_path.strip("/")]
         result = run_command(cmd, check=False)
         if result.returncode != 0:
-            return False
+            detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
+            summary = detail[0] if detail else f"exit {result.returncode}"
+            return None, f"ada --stat failed for {remote_path}: {summary}"
         try:
-            data = json.loads(result.stdout)
-            locality = data.get("fileLocality", "")
-            return "ONLINE" in locality.upper()
+            return json.loads(result.stdout), None
         except (json.JSONDecodeError, AttributeError):
+            preview = result.stdout.strip()[:200]
+            return None, f"ada --stat returned invalid JSON for {remote_path}: {preview!r}"
+
+    def _stat_request_json(self, request_id: str) -> tuple[dict | None, str | None]:
+        cmd = self._base_cmd() + ["--stat-request", request_id]
+        result = run_command(cmd, check=False)
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
+            summary = detail[0] if detail else f"exit {result.returncode}"
+            return None, f"ada --stat-request failed for {request_id}: {summary}"
+        try:
+            return json.loads(result.stdout), None
+        except (json.JSONDecodeError, AttributeError):
+            preview = result.stdout.strip()[:200]
+            return None, f"ada --stat-request returned invalid JSON for {request_id}: {preview!r}"
+
+    def is_online(self, remote_path: str) -> bool:
+        """Check file locality via ``ada --stat``."""
+        data, error = self._stat_json(remote_path)
+        if error or not isinstance(data, dict):
             return False
+        locality = data.get("fileLocality", "")
+        return "ONLINE" in str(locality).upper()
+
+    @staticmethod
+    def _payload_is_online(data: dict | None) -> bool:
+        if not isinstance(data, dict):
+            return False
+        locality = data.get("fileLocality", "")
+        return "ONLINE" in str(locality).upper()
+
+    def poll_online_statuses(self, remote_paths: list[str]) -> tuple[list[str], dict[str, str]]:
+        """Poll many paths efficiently by grouping ``ada --stat`` calls per parent directory."""
+        grouped: dict[str, list[tuple[str, str]]] = {}
+        for remote_path in remote_paths:
+            original = "/" + remote_path.strip("/") if remote_path.startswith("/") else remote_path.strip("/")
+            cleaned = remote_path.strip("/")
+            parent = posixpath.dirname(cleaned)
+            grouped.setdefault(parent, []).append((original, cleaned))
+
+        online: list[str] = []
+        errors: dict[str, str] = {}
+
+        for parent, paths in grouped.items():
+            data, error = self._stat_json(parent)
+            used_directory_children = False
+            if not error and isinstance(data, dict):
+                children = data.get("children")
+                if isinstance(children, list):
+                    child_map: dict[str, dict] = {}
+                    for child in children:
+                        if isinstance(child, dict):
+                            name = child.get("fileName")
+                            if isinstance(name, str):
+                                child_map[name.rstrip("/")] = child
+
+                    used_directory_children = True
+                    for original_path, cleaned_path in paths:
+                        name = posixpath.basename(cleaned_path)
+                        child = child_map.get(name)
+                        if child is None:
+                            fallback_data, fallback_error = self._stat_json(cleaned_path)
+                            if fallback_error:
+                                errors[original_path] = fallback_error
+                            elif self._payload_is_online(fallback_data):
+                                online.append(original_path)
+                            continue
+                        if self._payload_is_online(child):
+                            online.append(original_path)
+
+            if used_directory_children:
+                continue
+
+            for original_path, cleaned_path in paths:
+                fallback_data, fallback_error = self._stat_json(cleaned_path)
+                if fallback_error:
+                    if error:
+                        errors[original_path] = f"{error}; fallback failed: {fallback_error}"
+                    else:
+                        errors[original_path] = fallback_error
+                    continue
+                if self._payload_is_online(fallback_data):
+                    online.append(original_path)
+
+        return online, errors
+
+    def poll_stage_request_errors(
+        self,
+        request_ids: list[str],
+        relevant_paths: set[str],
+    ) -> dict[str, str]:
+        """Return per-path terminal bulk-request failures for the given stage requests."""
+        failures: dict[str, str] = {}
+        if not request_ids or not relevant_paths:
+            return failures
+
+        normalized_relevant = {"/" + path.strip("/") for path in relevant_paths}
+        for request_id in request_ids:
+            data, error = self._stat_request_json(request_id)
+            if error:
+                LOG.debug("could not inspect stage request %s: %s", request_id, error)
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            request_status = str(data.get("status", ""))
+            targets = data.get("targets")
+            if not isinstance(targets, list):
+                continue
+
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                target_path = target.get("target")
+                if not isinstance(target_path, str):
+                    continue
+                normalized_target = "/" + target_path.strip("/")
+                if normalized_target not in normalized_relevant:
+                    continue
+                state = str(target.get("state", ""))
+                if state.upper() in {"FAILED", "CANCELLED"}:
+                    error_message = str(target.get("errorMessage") or target.get("errorType") or request_status or "stage request failed")
+                    failures[normalized_target] = f"stage request {request_id} {state.lower()}: {error_message}"
+
+        return failures
 
     def wait_online(
         self,
@@ -1403,10 +1870,7 @@ class StageManager:
                     f"{len(pending)}/{len(remote_paths)} files still not online"
                 )
 
-            newly_online = []
-            for path in list(pending):
-                if self.is_online(path):
-                    newly_online.append(path)
+            newly_online, _ = self.poll_online_statuses(list(pending))
 
             for p in newly_online:
                 pending.discard(p)
@@ -1456,9 +1920,9 @@ class StageManager:
             elapsed = time.monotonic() - start
             if elapsed > timeout:
                 raise TimeoutError(f"staging timed out after {fmt_duration(elapsed)}")
-            for path in candidates:
-                if self.is_online(path):
-                    return path
+            online, _ = self.poll_online_statuses(candidates)
+            if online:
+                return online[0]
             time.sleep(poll_interval)
 
 
@@ -1772,7 +2236,10 @@ def _execute_simple(
 
 
 def _handle_failed_result(entry: dict, exc: BaseException, progress: Progress, bar: ProgressBar):
-    progress.failure(entry["rel"], entry.get("size", 0), exc)
+    stage_key = entry.get("remote_path")
+    if isinstance(stage_key, str):
+        stage_key = "/" + stage_key.strip("/")
+    progress.failure(entry["rel"], entry.get("size", 0), exc, stage_key=stage_key if isinstance(stage_key, str) else None)
     bar.finish()
     LOG.error("%s\u2718%s %s: %s", _C.RED, _C.RESET, entry["rel"], exc)
     bar.update(entry["rel"])
@@ -1781,10 +2248,14 @@ def _handle_failed_result(entry: dict, exc: BaseException, progress: Progress, b
 
 def _handle_completed_result(result: dict, entry: dict, progress: Progress, bar: ProgressBar):
     skipped = result.get("skipped", False)
+    stage_key = entry.get("remote_path")
+    if isinstance(stage_key, str):
+        stage_key = "/" + stage_key.strip("/")
     progress.success(
         entry["rel"], entry.get("size", 0),
         attempts=result.get("attempt", 1),
         skipped=skipped,
+        stage_key=stage_key if isinstance(stage_key, str) else None,
     )
     if skipped:
         LOG.debug("%s\u2714%s %s %s(verified)%s", _C.CYAN, _C.RESET, result["rel"], _C.DIM, _C.RESET)
@@ -1813,6 +2284,98 @@ def _handle_worker_result(
     return _handle_completed_result(result, entry, progress, bar)
 
 
+def _filter_verified_download_entries(
+    files: list[dict],
+    transferer: Transferer,
+) -> tuple[list[dict], list[dict]]:
+    """Remove download entries whose local target already matches the remote checksum."""
+    remaining: list[dict] = []
+    skipped: list[dict] = []
+
+    for entry in files:
+        local_path = Path(entry["local_path"])
+        if not transferer.skip_verified or not local_path.exists():
+            remaining.append(entry)
+            continue
+
+        remote_path = str(entry["remote_path"]).strip("/")
+        try:
+            remote_adler = transferer._remote_adler(remote_path)
+            local_adler = adler32_local(local_path)
+            if normalize_adler(local_adler) == normalize_adler(remote_adler):
+                transferer._delete_downloaded_source(remote_path)
+                LOG.debug("skip %s (verified before staging)", entry["rel"])
+                skipped.append(entry)
+                continue
+        except Exception:
+            LOG.debug("pre-stage checksum comparison failed for %s; downloading", entry["rel"])
+
+        remaining.append(entry)
+
+    return remaining, skipped
+
+
+def _build_stage_batches(files: list[dict], max_files: int, max_bytes: int) -> list[list[dict]]:
+    """Split download entries into batches bounded by file count and staged bytes."""
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    current_bytes = 0
+
+    for entry in files:
+        entry_size = max(int(entry.get("size", 0)), 0)
+        if current and (len(current) >= max_files or current_bytes + entry_size > max_bytes):
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(entry)
+        current_bytes += entry_size
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _format_stage_timeout_error(pending_paths: set[str], stage_errors: dict[str, str]) -> str:
+    missing_preview = ", ".join(sorted(pending_paths)[:5])
+    missing_suffix = "" if len(pending_paths) <= 5 else f" (+{len(pending_paths) - 5} more)"
+    error_lines = [
+        f"{path}: {stage_errors[path]}"
+        for path in sorted(pending_paths)
+        if path in stage_errors
+    ]
+    if error_lines:
+        preview = "; ".join(error_lines[:3])
+        suffix = "" if len(error_lines) <= 3 else f" (+{len(error_lines) - 3} more)"
+        return (
+            f"staging timed out; {len(pending_paths)} files still not online: {missing_preview}{missing_suffix}. "
+            f"Errors seen: {preview}{suffix}"
+        )
+    return f"staging timed out; {len(pending_paths)} files still not online: {missing_preview}{missing_suffix}"
+
+
+def _destage_paths(
+    stage_mgr: StageManager,
+    remote_paths: list[str],
+    batch_num: int,
+    bar: ProgressBar | None = None,
+) -> list[str]:
+    if not remote_paths:
+        return []
+    failures: list[str] = []
+    if bar is not None:
+        bar.finish()
+    for remote_path in remote_paths:
+        try:
+            stage_mgr.unstage([remote_path])
+            LOG.debug("destaged %s from batch %d", remote_path, batch_num)
+        except Exception as exc:
+            LOG.warning("destage failed for %s (batch %d): %s", remote_path, batch_num, exc)
+            failures.append(remote_path)
+    if bar is not None:
+        bar.update()
+    return failures
+
+
 def _execute_pipeline_download(
     files: list[dict],
     transferer: Transferer,
@@ -1821,6 +2384,7 @@ def _execute_pipeline_download(
     progress: Progress,
     bar: ProgressBar,
     stage_batch: int,
+    stage_batch_bytes: int,
     stage_lifetime: str,
     stage_poll: int,
     stage_timeout: int,
@@ -1831,62 +2395,182 @@ def _execute_pipeline_download(
     This avoids filling the staging area with more data than can be held at once.
     Files are processed in batches of ``stage_batch``.
     """
-    remote_path_to_entry = {"/" + e["remote_path"].strip("/"): e for e in files}
-    all_remote_paths = list(remote_path_to_entry.keys())
+    batches = _build_stage_batches(files, stage_batch, stage_batch_bytes)
+    stage_started_at: dict[int, float] = {}
+    prestaged_batches: set[int] = set()
+    stage_request_ids: dict[int, list[str]] = {}
 
     # Process in batches
-    for batch_start in range(0, len(all_remote_paths), stage_batch):
-        batch_paths = all_remote_paths[batch_start: batch_start + stage_batch]
-        batch_num = batch_start // stage_batch + 1
-        total_batches = (len(all_remote_paths) + stage_batch - 1) // stage_batch
+    for batch_index, batch_entries in enumerate(batches):
+        batch_paths = ["/" + e["remote_path"].strip("/") for e in batch_entries]
+        batch_path_to_entry = dict(zip(batch_paths, batch_entries))
+        batch_stage_entries = [(path, int(entry.get("size", 0))) for path, entry in batch_path_to_entry.items()]
+        batch_num = batch_index + 1
+        total_batches = len(batches)
 
         if total_batches > 1:
             LOG.info("batch %d/%d: staging %d file(s)", batch_num, total_batches, len(batch_paths))
 
+        fallback_enabled = stage_mgr.can_prime_via_webdav_range()
+
         # Stage this batch
-        stage_mgr.stage(batch_paths, lifetime=stage_lifetime)
+        if batch_index not in prestaged_batches:
+            stage_request_ids[batch_index] = stage_mgr.stage(batch_paths, lifetime=stage_lifetime)
+            stage_started_at[batch_index] = time.monotonic()
+            if not fallback_enabled:
+                for path, size in batch_stage_entries:
+                    progress.mark_stage_requested(path, size)
+            bar.update()
 
         # Wait for files in this batch to come online, then download them in daemon workers.
         pending_stage = set(batch_paths)
-        completed_paths: list[str] = []
         pending_downloads = 0
+        stage_error_messages: dict[str, str] = {}
+        deferred_destage_paths: list[str] = []
         pool = _DaemonWorkerPool(transferer.download, workers, name_prefix="stage-download-worker")
+        fallback_pool: _DaemonWorkerPool | None = None
+        if fallback_enabled:
+            fallback_pool = _DaemonWorkerPool(
+                stage_mgr.prime_via_webdav_range,
+                min(DEFAULT_STAGE_FALLBACK_WORKERS, max(len(batch_entries), 1)),
+                name_prefix="stage-fallback-worker",
+            )
+        fallback_requested_paths: set[str] = set()
+        fallback_inflight_paths: set[str] = set()
+        fallback_success_paths: set[str] = set()
+        fallback_failure_paths: set[str] = set()
+        fallback_success_log_count = 0
+        batch_total_bytes = sum(int(entry.get("size", 0)) for entry in batch_entries)
+        batch_completed_bytes = 0
+        batch_completed_files = 0
+        next_batch_index = batch_index + 1
+        next_batch_paths = ["/" + e["remote_path"].strip("/") for e in batches[next_batch_index]] if next_batch_index < total_batches else []
+        next_batch_stage_entries = [
+            ("/" + entry["remote_path"].strip("/"), int(entry.get("size", 0)))
+            for entry in batches[next_batch_index]
+        ] if next_batch_index < total_batches else []
+        batch_request_ids = stage_request_ids.get(batch_index, [])
+        prefetched_next_batch = False
 
         try:
             is_tty = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
-            stage_start = time.monotonic()
+            stage_start = stage_started_at.get(batch_index, time.monotonic())
 
             while pending_stage or pending_downloads:
+                if fallback_pool is not None:
+                    while True:
+                        try:
+                            fallback_entry, fallback_exc, _ = fallback_pool.get_result_nowait()
+                        except queue.Empty:
+                            break
+                        fallback_path = "/" + str(fallback_entry["remote_path"]).strip("/")
+                        fallback_inflight_paths.discard(fallback_path)
+                        if fallback_exc is None:
+                            if fallback_path in batch_path_to_entry:
+                                fallback_success_paths.add(fallback_path)
+                                timed_out = bool(fallback_entry.get("timed_out"))
+                                progress.mark_stage_requested(
+                                    fallback_path,
+                                    int(batch_path_to_entry[fallback_path].get("size", 0)),
+                                )
+                                previous_stage_error = (
+                                    stage_error_messages[fallback_path]
+                                    if fallback_path in stage_error_messages
+                                    else "ada stage failed"
+                                )
+                                if timed_out:
+                                    stage_error_messages[fallback_path] = previous_stage_error
+                                else:
+                                    stage_error_messages[fallback_path] = (
+                                        f"{previous_stage_error}; WebDAV fallback request completed successfully; waiting for ONLINE"
+                                    )
+                                if not fallback_inflight_paths and len(fallback_success_paths) > fallback_success_log_count:
+                                    bar.finish()
+                                    LOG.info(
+                                        "fallback: WebDAV priming requests finished for %d file(s) in batch %d/%d; waiting for them to come online",
+                                        len(fallback_success_paths),
+                                        batch_num,
+                                        total_batches,
+                                    )
+                                    bar.update()
+                                    fallback_success_log_count = len(fallback_success_paths)
+                            continue
+                        if fallback_path not in pending_stage:
+                            continue
+                        fallback_failure_paths.add(fallback_path)
+                        stage_error_messages[fallback_path] = str(fallback_exc)
+                        pending_stage.discard(fallback_path)
+                        progress.clear_stage_state(fallback_path, int(batch_path_to_entry[fallback_path].get("size", 0)))
+                        _handle_failed_result(batch_path_to_entry[fallback_path], fallback_exc, progress, bar)
+
                 # Check which pending files are now online
                 newly_online: list[str] = []
                 if pending_stage:
-                    for path in list(pending_stage):
-                        if stage_mgr.is_online(path):
-                            newly_online.append(path)
+                    request_failures = stage_mgr.poll_stage_request_errors(batch_request_ids, pending_stage)
+                    for path, error in request_failures.items():
+                        if path not in fallback_requested_paths:
+                            stage_error_messages[path] = error
+                    newly_failed_stage_paths = [path for path in request_failures if path in pending_stage]
+                    new_fallback_paths: list[str] = []
+                    terminal_stage_failures: list[str] = []
+                    for path in newly_failed_stage_paths:
+                        if fallback_pool is not None:
+                            if path in fallback_requested_paths:
+                                continue
+                            new_fallback_paths.append(path)
+                            continue
+                        terminal_stage_failures.append(path)
+
+                    if new_fallback_paths:
+                        preview = ", ".join(batch_path_to_entry[path]["rel"] for path in new_fallback_paths[:3])
+                        suffix = "" if len(new_fallback_paths) <= 3 else f" (+{len(new_fallback_paths) - 3} more)"
+                        bar.finish()
+                        LOG.info(
+                            "fallback: switching %d file(s) in batch %d/%d to WebDAV range-read staging after ada stage failure: %s%s",
+                            len(new_fallback_paths),
+                            batch_num,
+                            total_batches,
+                            preview,
+                            suffix,
+                        )
+                        bar.update()
+                        for path in new_fallback_paths:
+                            fallback_pool.submit({
+                                "remote_path": path,
+                                "rel": batch_path_to_entry[path]["rel"],
+                                "size": batch_path_to_entry[path].get("size", 0),
+                            })
+                            fallback_requested_paths.add(path)
+                            fallback_inflight_paths.add(path)
+                            stage_error_messages[path] = f"{request_failures[path]}; trying WebDAV range-read fallback"
+                        bar.update()
+
+                    for path in terminal_stage_failures:
+                        pending_stage.discard(path)
+                        progress.clear_stage_state(path, int(batch_path_to_entry[path].get("size", 0)))
+                        _handle_failed_result(
+                            batch_path_to_entry[path],
+                            RuntimeError(request_failures[path]),
+                            progress,
+                            bar,
+                        )
+
+                    newly_online, poll_errors = stage_mgr.poll_online_statuses(list(pending_stage))
+                    for path, error in poll_errors.items():
+                        stage_error_messages[path] = error
                     for path in newly_online:
                         pending_stage.discard(path)
-                        entry = remote_path_to_entry[path]
+                        stage_error_messages.pop(path, None)
+                        progress.mark_stage_online(path, int(batch_path_to_entry[path].get("size", 0)))
+                        entry = batch_path_to_entry[path]
                         pool.submit(entry)
                         pending_downloads += 1
-
-                    # Show staging progress when still waiting
-                    if pending_stage and is_tty:
-                        staged_n = len(batch_paths) - len(pending_stage)
-                        elapsed = time.monotonic() - stage_start
-                        pct = staged_n / len(batch_paths) if batch_paths else 1.0
-                        filled = int(ProgressBar.BAR_WIDTH * pct)
-                        bar_fill = f"{_C.BG_BLUE}{_C.WHITE}" + " " * filled + f"{_C.RESET}"
-                        bar_empty = f"{_C.DIM}" + "\u2591" * (ProgressBar.BAR_WIDTH - filled) + f"{_C.RESET}"
-                        sbar = bar_fill + bar_empty
-                        sys.stderr.write(
-                            f"\r\033[K  {sbar} {_C.BLUE}staging{_C.RESET}: "
-                            f"{_C.CYAN}{staged_n}{_C.RESET}/{len(batch_paths)} ONLINE  "
-                            f"{_C.DIM}{fmt_duration(elapsed)} elapsed{_C.RESET}"
-                        )
-                        sys.stderr.flush()
+                    if newly_online:
+                        bar.update()
 
                 # Check completed downloads
                 done_results = 0
+                newly_destageable_paths: list[str] = []
                 while pending_downloads:
                     try:
                         entry, exc, result = pool.get_result_nowait()
@@ -1896,7 +2580,35 @@ def _execute_pipeline_download(
                     done_results += 1
                     handled = _handle_worker_result(entry, exc, result, progress, bar)
                     if handled is not None:
-                        completed_paths.append("/" + str(entry["remote_path"]).strip("/"))
+                        batch_completed_bytes += int(entry.get("size", 0))
+                        batch_completed_files += 1
+                        newly_destageable_paths.append("/" + str(entry["remote_path"]).strip("/"))
+
+                if destage and newly_destageable_paths:
+                    deferred_destage_paths.extend(
+                        _destage_paths(stage_mgr, newly_destageable_paths, batch_num, bar)
+                    )
+
+                if (
+                    not prefetched_next_batch
+                    and next_batch_paths
+                    and not pending_stage
+                ):
+                    if batch_total_bytes > 0:
+                        completion_fraction = batch_completed_bytes / batch_total_bytes
+                    else:
+                        completion_fraction = batch_completed_files / len(batch_entries) if batch_entries else 1.0
+                    if completion_fraction >= 0.5:
+                        bar.finish()
+                        stage_request_ids[next_batch_index] = stage_mgr.stage(next_batch_paths, lifetime=stage_lifetime)
+                        stage_started_at[next_batch_index] = time.monotonic()
+                        prestaged_batches.add(next_batch_index)
+                        if not fallback_enabled:
+                            for path, size in next_batch_stage_entries:
+                                progress.mark_stage_requested(path, size)
+                        prefetched_next_batch = True
+                        LOG.info("pre-staging batch %d/%d while batch %d is still copying", next_batch_index + 1, total_batches, batch_num)
+                        bar.update()
 
                 # Check staging timeout
                 if pending_stage:
@@ -1904,16 +2616,11 @@ def _execute_pipeline_download(
                         if is_tty:
                             sys.stderr.write("\r\033[K")
                             sys.stderr.flush()
-                        raise TimeoutError(
-                            f"staging timed out; {len(pending_stage)} files still not online"
-                        )
+                        raise TimeoutError(_format_stage_timeout_error(pending_stage, stage_error_messages))
                     if not done_results and not newly_online:
                         time.sleep(stage_poll)
                 elif pending_downloads:
                     # All staged, just wait for downloads to finish
-                    if is_tty:
-                        sys.stderr.write("\r\033[K")
-                        sys.stderr.flush()
                     try:
                         entry, exc, result = pool.get_result(timeout=10)
                     except queue.Empty:
@@ -1922,25 +2629,35 @@ def _execute_pipeline_download(
                         pending_downloads -= 1
                         handled = _handle_worker_result(entry, exc, result, progress, bar)
                         if handled is not None:
-                            completed_paths.append("/" + str(entry["remote_path"]).strip("/"))
+                            batch_completed_bytes += int(entry.get("size", 0))
+                            batch_completed_files += 1
+                            completed_path = "/" + str(entry["remote_path"]).strip("/")
+                            if destage:
+                                deferred_destage_paths.extend(
+                                    _destage_paths(stage_mgr, [completed_path], batch_num, bar)
+                                )
 
-            if is_tty:
-                sys.stderr.write("\r\033[K")
-                sys.stderr.flush()
-        except KeyboardInterrupt:
+        except BaseException:
             pool.stop()
+            if fallback_pool is not None:
+                fallback_pool.stop()
+            progress.clear_stage_states([(path, int(entry.get("size", 0))) for path, entry in batch_path_to_entry.items()])
+            if destage and deferred_destage_paths:
+                _destage_paths(stage_mgr, deferred_destage_paths, batch_num, bar)
+            if prefetched_next_batch and next_batch_paths:
+                _destage_paths(stage_mgr, next_batch_paths, next_batch_index + 1, bar)
+                progress.clear_stage_states(next_batch_stage_entries)
+            bar.update()
             raise
         finally:
             pool.finish_submissions()
             pool.join(timeout=1)
+            if fallback_pool is not None:
+                fallback_pool.finish_submissions()
+                fallback_pool.join(timeout=1)
 
-        # Destage this batch's files
-        if destage and completed_paths:
-            try:
-                stage_mgr.unstage(completed_paths)
-                LOG.debug("destaged %d file(s) from batch %d", len(completed_paths), batch_num)
-            except Exception as exc:
-                LOG.warning("destage failed for batch %d: %s", batch_num, exc)
+        if destage and deferred_destage_paths:
+            _destage_paths(stage_mgr, deferred_destage_paths, batch_num, bar)
 
 
 # ---------------------------------------------------------------------------
@@ -2001,7 +2718,9 @@ def build_parser(*, prog: str = "dcache_cp", delete_source: bool = False) -> arg
     p.add_argument("--no-destage", action="store_true",
                     help="Keep files staged after download (default: destage after verified copy)")
     p.add_argument("--stage-batch", type=int, default=DEFAULT_STAGE_BATCH,
-                    help="Files to stage at a time (default: 50)")
+                    help="Max files to stage at a time (default: 10000)")
+    p.add_argument("--stage-batch-bytes", type=int, default=DEFAULT_STAGE_BATCH_BYTES,
+                    help="Max bytes to stage at a time (default: 5497558138880 = 5 TiB)")
     p.add_argument("--stage-timeout", type=int, default=DEFAULT_STAGE_TIMEOUT,
                     help="Seconds to wait for files to come online (default: 86400 = 24h)")
     p.add_argument("--stage-poll", type=int, default=DEFAULT_STAGE_POLL,
@@ -2130,16 +2849,36 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
         LOG.error("--max-retries must be >= 0"); return 1
     if args.stage_batch < 1:
         LOG.error("--stage-batch must be >= 1"); return 1
+    if args.stage_batch_bytes < 1:
+        LOG.error("--stage-batch-bytes must be >= 1"); return 1
 
     if not files:
         LOG.info("no files to process")
         return 0
 
-    total_bytes = sum(e.get("size", 0) for e in files)
+    planned_files = files
+    planned_total_files = len(planned_files)
+    planned_total_bytes = sum(e.get("size", 0) for e in planned_files)
+
+    # ---- Transferer ----
+    transferer = Transferer(
+        rclone_config=rclone_config, remote=remote, ada_cmd=args.ada,
+        api=api, max_retries=args.max_retries, retry_wait=args.retry_wait,
+        copy_timeout=args.copy_timeout, checksum_timeout=args.checksum_timeout,
+        skip_verified=args.skip_verified, delete_source=delete_source,
+    )
+
+    pre_skipped_entries: list[dict] = []
+    if direction == "download" and args.skip_verified:
+        LOG.info("resume  : checking for already verified local files before download")
+        files, pre_skipped_entries = _filter_verified_download_entries(files, transferer)
+
+    total_bytes = planned_total_bytes
+    remaining_bytes = sum(e.get("size", 0) for e in files)
 
     # ---- Dry run ----
     if args.dry_run:
-        LOG.info("dry run (%s): %d file(s), %s", direction, len(files), format_bytes(total_bytes))
+        LOG.info("dry run (%s): %d file(s), %s", direction, len(files), format_bytes(remaining_bytes))
         for e in files:
             if direction == "upload":
                 LOG.info("  %s -> %s (%s)", e["rel"], e["remote_path"], format_bytes(e.get("size", 0)))
@@ -2165,27 +2904,30 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
     LOG.info("%smode%s    : %s %s%s%s", _C.DIM, _C.RESET, arrow, _C.BOLD, direction, _C.RESET)
     if args.file_list:
         LOG.info("%slist%s    : %s", _C.DIM, _C.RESET, args.file_list)
-    LOG.info("%sfiles%s   : %s%d%s (%s)", _C.DIM, _C.RESET, _C.CYAN, len(files), _C.RESET, format_bytes(total_bytes))
+    LOG.info("%sfiles%s   : %s%d%s (%s)", _C.DIM, _C.RESET, _C.CYAN, planned_total_files, _C.RESET, format_bytes(total_bytes))
     LOG.info("%sworkers%s : %d  retries: %d  skip-verified: %s",
              _C.DIM, _C.RESET, args.workers, args.max_retries, "yes" if args.skip_verified else "no")
     if delete_source:
         LOG.info("%ssource%s  : delete after verified transfer", _C.DIM, _C.RESET)
     if direction == "download" and not args.no_stage:
-        LOG.info("%sstaging%s : batch=%d  lifetime=%s  poll=%ds  timeout=%s",
-                 _C.DIM, _C.RESET, args.stage_batch, args.stage_lifetime, args.stage_poll,
+        LOG.info("%sstaging%s : max-files=%d  max-bytes=%s  lifetime=%s  poll=%ds  timeout=%s",
+                 _C.DIM, _C.RESET, args.stage_batch, format_bytes(args.stage_batch_bytes), args.stage_lifetime, args.stage_poll,
                  fmt_duration(args.stage_timeout))
+    if pre_skipped_entries:
+        LOG.info("%sresume%s  : %s%d%s already verified, skipping stage/copy for %s",
+                 _C.DIM, _C.RESET, _C.CYAN, len(pre_skipped_entries), _C.RESET,
+                 format_bytes(sum(e.get("size", 0) for e in pre_skipped_entries)))
     if quota and quota.ok:
         LOG.info("%squota%s   : %s", _C.DIM, _C.RESET, quota.summary_line())
     LOG.info("")
 
-    # ---- Transferer ----
-    transferer = Transferer(
-        rclone_config=rclone_config, remote=remote, ada_cmd=args.ada,
-        api=api, max_retries=args.max_retries, retry_wait=args.retry_wait,
-        copy_timeout=args.copy_timeout, checksum_timeout=args.checksum_timeout,
-        skip_verified=args.skip_verified, delete_source=delete_source,
-    )
-    progress = Progress(total_files=len(files), total_bytes=total_bytes)
+    if not files:
+        LOG.info("all planned download files are already verified locally")
+        return 0
+
+    progress = Progress(total_files=planned_total_files, total_bytes=total_bytes)
+    for entry in pre_skipped_entries:
+        progress.success(entry["rel"], entry.get("size", 0), attempts=0, skipped=True)
     transferer.progress = progress
     bar = ProgressBar(progress, quota=quota)
 
@@ -2196,7 +2938,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
         elif args.no_stage:
             _execute_simple(files, transferer.download, args.workers, progress, bar)
         else:
-            stage_mgr = StageManager(args.ada, rclone_config, api)
+            stage_mgr = StageManager(args.ada, rclone_config, api, config[remote])
             _execute_pipeline_download(
                 files=files,
                 transferer=transferer,
@@ -2205,6 +2947,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
                 progress=progress,
                 bar=bar,
                 stage_batch=args.stage_batch,
+                stage_batch_bytes=args.stage_batch_bytes,
                 stage_lifetime=args.stage_lifetime,
                 stage_poll=args.stage_poll,
                 stage_timeout=args.stage_timeout,

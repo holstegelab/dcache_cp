@@ -113,12 +113,17 @@ When `dcache_cp` resolves `~/macaroons/dcache.conf`, it also checks for
 ### Download flow
 
 1. Enumerate remote files via `rclone lsjson`
-2. Process in batches of `--stage-batch` (default 50) to avoid exceeding staging area:
+2. If `--skip-verified` is enabled, compare existing local files against remote
+  checksums first and skip already verified files before staging them
+3. Process in batches of `--stage-batch` (default 10000, also limited by `--stage-batch-bytes`) to avoid exceeding staging area:
    - **Stage** the batch via `ada --stage --from-file`
+  - If the dCache API reports per-file stage failures, `dcache_cp` falls back to
+    authenticated 1-byte WebDAV reads to trigger dCache's normal on-read staging
+    path for those files
    - **Poll** each file; as soon as a file is ONLINE, start downloading it immediately
    - **Download** in parallel with `rclone copyto`, verify Adler-32
-   - **Destage** the batch after all files in it are verified
-3. Repeat for the next batch
+  - **Destage** each file as soon as its download has been verified
+4. Repeat for the next batch
 
 This pipeline approach means the staging area only holds one batch at a time,
 so it works even when the total dataset is larger than the available staging
@@ -199,7 +204,7 @@ options:
   --checksum-timeout N Max seconds to wait for dCache checksum (default: 14400 = 4h)
   --no-stage           Skip staging (download only)
   --no-destage         Keep files staged after download
-  --stage-batch N      Files to stage per batch (default: 50)
+  --stage-batch N      Files to stage per batch (default: 10000)
   --stage-timeout SEC  Max wait for staging (default: 86400 = 24h)
   --stage-poll SEC     Poll interval for staging (default: 60)
   --stage-lifetime DUR Pin lifetime (default: 7D)
