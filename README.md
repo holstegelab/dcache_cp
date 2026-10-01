@@ -39,6 +39,9 @@ dcache_mv ./sample.bam dcache:/results/sample.bam
 # Download from dCache (stages from tape automatically, in batches)
 dcache_cp dcache:/results/ ./local_copy/ -R
 
+# Download a single file to an exact local filename
+dcache_cp dcache:/results/sample.bam ./renamed.bam
+
 # Move a file out of dCache (delete remote source after verified download)
 dcache_mv dcache:/results/sample.bam ./sample.bam
 
@@ -86,6 +89,18 @@ If not found in `~/macaroons/`, the tool searches project-level directories:
 Falls back to `$RCLONE_CONFIG`, `~/config/rclone/rclone.conf`,
 `~/.config/rclone/rclone.conf` if no match is found.
 Use `--config` to override explicitly.
+
+### Download destinations and dry runs
+
+A single remote file is copied to the exact local destination filename. If the
+destination is an existing directory or ends with `/`, the source filename is
+appended instead. Multiple remote sources always use a destination directory.
+Directory downloads place the directory's contents under the local destination.
+
+Both `dcache_cp --dry-run` and `dcache_mv --dry-run` stop after planning. They may
+list remote paths to build the plan, but do not compare checksums, stage data,
+copy files, or delete sources. Already verified files remain in the preview;
+checksum-based skipping happens only during an actual transfer.
 
 ### Pool sidecar file
 

@@ -789,6 +789,19 @@ def _rclone_lsjson(
     return entries
 
 
+def _rclone_stat(rclone_config: Path, remote: str, remote_path: str) -> dict:
+    """Return metadata for the requested object, rather than its contents."""
+    remote_path = remote_path.strip("/")
+    target = f"{remote}:{remote_path}" if remote_path else f"{remote}:"
+    result = run_command([
+        "rclone", "--config", str(rclone_config), "lsjson", target, "--stat",
+    ])
+    entry = json.loads(result.stdout)
+    if not isinstance(entry, dict) or not isinstance(entry.get("IsDir"), bool):
+        raise ValueError(f"unexpected lsjson --stat output for {target}")
+    return entry
+
+
 def _fill_file_list_download_sizes(
     rclone_config: Path,
     remote: str,
@@ -939,16 +952,31 @@ def plan_upload(source: Path, destination: str, recursive: bool,
 
 def plan_download(
     rclone_config: Path, remote: str, remote_path: str,
-    local_dest: Path, recursive: bool,
+    local_dest: Path | str, recursive: bool,
     spinner: "_EnumSpinner | None" = None,
 ) -> list[dict]:
     """Enumerate remote files via ``rclone lsjson`` and map them to local paths."""
-    entries = _rclone_lsjson(rclone_config, remote, remote_path, recursive=recursive)
     remote_path = remote_path.strip("/")
     if not remote_path:
         raise ValueError("remote path must not be empty")
 
-    local_dest = local_dest.expanduser().resolve()
+    dest_is_dir = str(local_dest).endswith("/")
+    local_dest = Path(local_dest).expanduser().resolve()
+    source = _rclone_stat(rclone_config, remote, remote_path)
+
+    if not source["IsDir"]:
+        name = posixpath.basename(remote_path)
+        local_target = local_dest / name if dest_is_dir or local_dest.is_dir() else local_dest
+        if spinner:
+            spinner.tick()
+        return [{
+            "remote_path": remote_path,
+            "local_path": local_target,
+            "rel": name,
+            "size": source.get("Size", 0),
+        }]
+
+    entries = _rclone_lsjson(rclone_config, remote, remote_path, recursive=recursive)
 
     if not entries:
         raise FileNotFoundError(f"no files found at remote path: {remote_path}")
@@ -2839,7 +2867,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
             for src_raw in sources_raw:
                 _, src_path = parse_remote_prefix(src_raw)
                 files.extend(plan_download(rclone_config, remote, src_path,
-                                           Path(dst_path_dir), args.recursive,
+                                           dst_path_dir, args.recursive,
                                            spinner=spinner))
 
     # ---- Validate ----
@@ -2860,6 +2888,18 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
     planned_total_files = len(planned_files)
     planned_total_bytes = sum(e.get("size", 0) for e in planned_files)
 
+    # ---- Dry run ----
+    # Resume verification can delete matching sources for moves. Return before
+    # constructing the transfer engine or doing any checksum/staging work.
+    if args.dry_run:
+        LOG.info("dry run (%s): %d file(s), %s", direction, len(files), format_bytes(planned_total_bytes))
+        for e in files:
+            if direction == "upload":
+                LOG.info("  %s -> %s (%s)", e["rel"], e["remote_path"], format_bytes(e.get("size", 0)))
+            else:
+                LOG.info("  %s -> %s (%s)", e["remote_path"], e.get("local_path", "?"), format_bytes(e.get("size", 0)))
+        return 0
+
     # ---- Transferer ----
     transferer = Transferer(
         rclone_config=rclone_config, remote=remote, ada_cmd=args.ada,
@@ -2874,17 +2914,6 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
         files, pre_skipped_entries = _filter_verified_download_entries(files, transferer)
 
     total_bytes = planned_total_bytes
-    remaining_bytes = sum(e.get("size", 0) for e in files)
-
-    # ---- Dry run ----
-    if args.dry_run:
-        LOG.info("dry run (%s): %d file(s), %s", direction, len(files), format_bytes(remaining_bytes))
-        for e in files:
-            if direction == "upload":
-                LOG.info("  %s -> %s (%s)", e["rel"], e["remote_path"], format_bytes(e.get("size", 0)))
-            else:
-                LOG.info("  %s -> %s (%s)", e["remote_path"], e.get("local_path", "?"), format_bytes(e.get("size", 0)))
-        return 0
 
     # ---- Quota tracker ----
     quota: QuotaTracker | None = None
