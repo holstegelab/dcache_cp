@@ -140,27 +140,35 @@ them or retrying, and retain the source until verification succeeds.
   checksums first and skip already verified files before staging them
 3. Process in batches of `--stage-batch` (default 10000, also limited by `--stage-batch-bytes`) to avoid exceeding staging area:
    - **Stage** the batch via `ada --stage --from-file`
-  - If the initial ADA stage command or a per-file stage request fails, `dcache_cp` falls back to
-    authenticated 1-byte WebDAV reads to trigger dCache's normal on-read staging
-    path for those files
-   - **Poll** each file; as soon as a file is ONLINE, start downloading it immediately
+   - If the initial ADA stage command or a per-file stage request fails, `dcache_cp`
+     falls back to authenticated 1-byte WebDAV reads to trigger dCache's normal
+     on-read staging path for those files
+   - **Poll** each file and its PIN request; download once it is ONLINE and its
+     requested pin has completed
    - **Download** in parallel to unique local temporary files, verify Adler-32,
      then atomically replace the final filenames
-  - **Destage** the batch after its downloads finish, before staging another batch
+   - **Destage** the batch after its downloads finish, releasing only pins belonging
+     to its stage request IDs. Wait for UNPIN completion before staging another batch
 4. Repeat for the next batch
 
-This pipeline approach means the staging area only holds one batch at a time,
-so it works even when the total dataset is larger than the available staging
-space.
+At most one batch of this command's explicit pins is active at a time. Released
+copies may remain cached, and other jobs share the pool: batch limits are not a
+space reservation. WebDAV fallback reads do not guarantee explicit pins.
 
 Use `--no-stage` if files are already online.  Use `--no-destage` to keep
 them pinned. With `--no-destage`, the entire retained set must fit the configured
 file and byte limits. A file larger than `--stage-batch-bytes` is rejected before
 staging; increase the limit explicitly. Failed pin release prevents the next batch.
+Cleanup has a 120-second budget. Pending owned PIN requests are cancelled and
+settled before their pins are released. Cleanup never releases another request's
+pins, including when staging used only the WebDAV fallback.
 
 Each unique remote source is staged once per batch. Copy requests for that source
 to several local destinations are all preserved. Bearer tokens are passed to curl
 through owner-only temporary header files rather than command-line arguments.
+The tool follows ADA's returned bulk-request URLs for status and release, so
+this also works with ADA versions lacking `--stat-request`. Paginated target
+statuses are checked, and UUIDs in filenames are not mistaken for request IDs.
 
 ### Move flow
 

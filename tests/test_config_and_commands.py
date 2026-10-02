@@ -82,6 +82,25 @@ class ConfigAndCommandTests(unittest.TestCase):
         self.assertNotIn("FAKE_SECRET", error.exception.stdout)
         self.assertNotIn("FAKE_SECRET", "\n".join(logs.output))
 
+    def test_bulk_api_uses_selected_credentials_in_a_private_header_file(self):
+        cfg = cli.load_rclone_config(self.config)
+        manager = cli.StageManager("ada", self.config, None, cfg["second"])
+        captured = []
+        def curl(args, **kwargs):
+            self.assertFalse(any("FAKE_SECOND" in arg for arg in args))
+            header = Path(args[args.index("--header") + 1].removeprefix("@"))
+            body = Path(args[args.index("--data-binary") + 1].removeprefix("@"))
+            self.assertEqual(header.stat().st_mode & 0o777, 0o600)
+            self.assertIn("Authorization: Bearer FAKE_SECOND\n", header.read_text())
+            self.assertNotIn("FAKE_FIRST", header.read_text())
+            self.assertEqual(json.loads(body.read_text()), {"target": ['/a "quoted" file']})
+            captured.extend([header, body])
+            return subprocess.CompletedProcess(args, 0, "{}", "")
+        with patch.object(cli, "run_command", side_effect=curl):
+            manager._api_request("https://example.invalid/api/v1/bulk-requests", method="POST",
+                                 data={"target": ['/a "quoted" file']})
+        self.assertTrue(all(not path.exists() for path in captured))
+
     def test_command_deadline_terminates_blocking_process(self):
         start = time.monotonic()
         with self.assertRaises(subprocess.TimeoutExpired):

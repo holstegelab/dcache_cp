@@ -1700,6 +1700,9 @@ class StageManager:
         self.webdav_bearer_token = remote_cfg.get("bearer_token", fallback=None) if remote_cfg else None
         self.webdav_bearer_token_command = remote_cfg.get("bearer_token_command", fallback=None) if remote_cfg else None
         self._resolved_webdav_bearer_token = (self.webdav_bearer_token or "").strip() or None
+        self._request_urls: dict[str, str] = {}
+        self._pin_requests: dict[str, set[str]] = {}
+        self._pending_pins: set[str] = set()
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -1870,27 +1873,112 @@ class StageManager:
             list_file = fh.name
         try:
             result = self._run_ada(["--stage", "--from-file", list_file, "--lifetime", lifetime])
-            request_ids = _extract_ada_request_ids((result.stdout or "") + "\n" + (result.stderr or ""))
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            # ADA also prints targets, whose filenames can contain UUIDs.
+            # Only UUIDs in returned bulk URLs identify requests we own.
+            request_ids = self._remember_request_urls(output)
             if request_ids:
                 LOG.info("stage request id(s): %s", ", ".join(request_ids))
             else:
-                LOG.debug("no stage request id found in ada output")
+                raise RuntimeError("ADA accepted staging without a request id; cannot track its pins")
+            paths = {"/" + p.strip("/") for p in remote_paths}
+            for request_id in request_ids:
+                self._pin_requests[request_id] = paths.copy()
+            self._pending_pins.update(paths)
             return request_ids
         finally:
             os.unlink(list_file)
 
     def unstage(self, remote_paths: list[str]):
-        """Release pins via ``ada --unstage --from-file``."""
-        if not remote_paths:
+        """Release only this manager's pins and wait for asynchronous completion."""
+        requested = {"/" + p.strip("/") for p in remote_paths}
+        if not requested:
             return
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
-            for p in remote_paths:
-                fh.write("/" + p.strip("/") + "\n")
-            list_file = fh.name
+        # A queued PIN can create a pin after an early UNPIN. Settle or cancel
+        # the owned PIN request first, then release pins using that request id.
+        old_deadline = self.deadline
+        self.deadline = time.monotonic() + DEFAULT_COMMAND_TIMEOUT
         try:
-            self._run_ada(["--unstage", "--from-file", list_file], cleanup=True)
+            for request_id, paths in list(self._pin_requests.items()):
+                release_paths = requested.intersection(paths)
+                if not release_paths:
+                    continue
+                url = self._request_urls.get(request_id)
+                if not url:
+                    raise RuntimeError(f"no API URL for owned stage request {request_id}; refusing to release unrelated pins")
+                if release_paths.intersection(self._pending_pins):
+                    self._api_request(url, method="PATCH", data={"action": "cancel"}, cleanup=True)
+                self._wait_request_terminal(request_id, cleanup=True, allow_cancelled=True)
+                output = self._api_request(url.rsplit("/", 1)[0], method="POST", cleanup=True,
+                                           data={"activity": "UNPIN", "arguments": {"id": request_id},
+                                                 "target": sorted(release_paths), "expand_directories": "NONE"})
+                release_ids = self._remember_request_urls(output)
+                if not release_ids:
+                    raise RuntimeError("UNPIN accepted without a request URL; pin release is unconfirmed")
+                for release_id in release_ids:
+                    self._wait_request_terminal(release_id, cleanup=True, expected_paths=release_paths)
+                paths.difference_update(release_paths)
+                self._pending_pins.difference_update(release_paths)
+                if not paths:
+                    del self._pin_requests[request_id]
+                LOG.info("released %d pin(s) from stage request %s", len(release_paths), request_id)
         finally:
-            os.unlink(list_file)
+            self.deadline = old_deadline
+
+    def _remember_request_urls(self, output: str) -> list[str]:
+        ids = []
+        for url in re.findall(r"https?://[^\s\"'<>]+/bulk-requests/[0-9a-fA-F-]{36}", output):
+            request_id = url.rsplit("/", 1)[-1]
+            self._request_urls[request_id] = url
+            if request_id not in ids:
+                ids.append(request_id)
+        return ids
+
+    def _api_request(self, url: str, *, method: str = "GET", data: dict | None = None,
+                     cleanup: bool = False) -> str:
+        """Use returned bulk URLs even with ADA versions lacking --stat-request."""
+        timeout = self._command_timeout()
+        cancel_event = None if cleanup else self.cancel_event
+        with _ada_tokenfile(self.tokenfile, self.remote, timeout=timeout, cancel_event=cancel_event) as (_, token):
+            with tempfile.NamedTemporaryFile("w", suffix=".headers") as headers, \
+                    tempfile.NamedTemporaryFile("w", suffix=".json") as body:
+                headers.write(f"Authorization: Bearer {token}\nContent-Type: application/json\n")
+                headers.flush()
+                cmd = ["curl", "--silent", "--show-error", "--fail", "--connect-timeout", "10",
+                       "--max-time", str(self._command_timeout()), "--header", "@" + headers.name,
+                       "--request", method]
+                if data is not None:
+                    json.dump(data, body)
+                    body.flush()
+                    cmd += ["--data-binary", "@" + body.name]
+                if method == "POST":
+                    cmd += ["--dump-header", "-"]
+                result = run_command(cmd + [url], timeout=self._command_timeout(), cancel_event=cancel_event,
+                                     secrets=(token,))
+                return result.stdout
+
+    def _wait_request_terminal(self, request_id: str, *, cleanup: bool = False,
+                               allow_cancelled: bool = False, expected_paths: set[str] | None = None) -> None:
+        while True:
+            data, error = self._stat_request_json(request_id, cleanup=cleanup)
+            if error or not isinstance(data, dict):
+                raise RuntimeError(error or f"invalid status for bulk request {request_id}")
+            status = str(data.get("status", "")).upper()
+            if status in {"COMPLETED", "CANCELLED", "FAILED"}:
+                if allow_cancelled:
+                    return  # Failed PIN targets are handled by the pipeline/fallback.
+                failed = [t for t in data.get("targets", []) if t.get("state", "").upper() != "COMPLETED"]
+                if status != "COMPLETED" or failed:
+                    raise RuntimeError(f"bulk request {request_id} failed: {status}; targets: {failed}")
+                confirmed = {"/" + t.get("target", "").strip("/") for t in data.get("targets", [])}
+                if expected_paths and not expected_paths.issubset(confirmed):
+                    raise RuntimeError(f"bulk request {request_id} omitted targets; pin release is unconfirmed")
+                return
+            wait = min(1, self._command_timeout())
+            if cleanup:
+                time.sleep(wait)
+            elif self.cancel_event.wait(wait):
+                raise TransferCancelled("staging cancelled")
 
     def _stat_json(self, remote_path: str) -> tuple[dict | None, str | None]:
         """Return parsed ``ada --stat`` JSON for a path, or an error string."""
@@ -1905,7 +1993,33 @@ class StageManager:
             preview = result.stdout.strip()[:200]
             return None, f"ada --stat returned invalid JSON for {remote_path}: {preview!r}"
 
-    def _stat_request_json(self, request_id: str) -> tuple[dict | None, str | None]:
+    def _stat_request_json(self, request_id: str, *, cleanup: bool = False) -> tuple[dict | None, str | None]:
+        url = self._request_urls.get(request_id)
+        if url:
+            # Target results are paginated. Later pages can contain failed pins.
+            try:
+                data = json.loads(self._api_request(url, cleanup=cleanup))
+                if not isinstance(data, dict) or data.get("uid") != request_id:
+                    raise ValueError("bulk response does not identify the requested job")
+                targets = list(data.get("targets", []))
+                offset = data.get("nextId", -1)
+                seen = set()
+                while offset is not None and int(offset) >= 0:
+                    if offset in seen:
+                        raise ValueError("repeated bulk target pagination offset")
+                    seen.add(offset)
+                    page = json.loads(self._api_request(url + "?offset=" + str(int(offset)), cleanup=cleanup))
+                    if not isinstance(page, dict) or page.get("uid") != request_id:
+                        raise ValueError("bulk target page does not identify the requested job")
+                    targets.extend(page.get("targets", []))
+                    offset = page.get("nextId", -1)
+                data["targets"] = targets
+                if any(not isinstance(t, dict) or not isinstance(t.get("state"), str)
+                       or not isinstance(t.get("target"), str) for t in targets):
+                    raise ValueError("invalid bulk target status")
+                return data, None
+            except (ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+                return None, f"could not inspect bulk request {request_id}: {exc}"
         result = self._run_ada(["--stat-request", request_id], check=False)
         if result.returncode != 0:
             detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
@@ -1931,6 +2045,9 @@ class StageManager:
             return False
         locality = data.get("fileLocality", "")
         return "ONLINE" in str(locality).upper()
+
+    def _download_ready(self, remote_path: str, data: dict | None) -> bool:
+        return self._payload_is_online(data) and "/" + remote_path.strip("/") not in self._pending_pins
 
     def poll_online_statuses(self, remote_paths: list[str]) -> tuple[list[str], dict[str, str]]:
         """Poll many paths efficiently by grouping ``ada --stat`` calls per parent directory."""
@@ -1965,10 +2082,10 @@ class StageManager:
                             fallback_data, fallback_error = self._stat_json(cleaned_path)
                             if fallback_error:
                                 errors[original_path] = fallback_error
-                            elif self._payload_is_online(fallback_data):
+                            elif self._download_ready(original_path, fallback_data):
                                 online.append(original_path)
                             continue
-                        if self._payload_is_online(child):
+                        if self._download_ready(original_path, child):
                             online.append(original_path)
 
             if used_directory_children:
@@ -1982,7 +2099,7 @@ class StageManager:
                     else:
                         errors[original_path] = fallback_error
                     continue
-                if self._payload_is_online(fallback_data):
+                if self._download_ready(original_path, fallback_data):
                     online.append(original_path)
 
         return online, errors
@@ -2021,6 +2138,8 @@ class StageManager:
                 if normalized_target not in normalized_relevant:
                     continue
                 state = str(target.get("state", ""))
+                if state.upper() in {"COMPLETED", "FAILED", "CANCELLED"}:
+                    self._pending_pins.discard(normalized_target)
                 if state.upper() in {"FAILED", "CANCELLED"}:
                     error_message = str(target.get("errorMessage") or target.get("errorType") or request_status or "stage request failed")
                     failures[normalized_target] = f"stage request {request_id} {state.lower()}: {error_message}"
@@ -2048,6 +2167,9 @@ class StageManager:
                     f"{len(pending)}/{len(remote_paths)} files still not online"
                 )
 
+            failures = self.poll_stage_request_errors(list(self._pin_requests), pending)
+            if failures:
+                raise RuntimeError("staging failed: " + "; ".join(failures.values()))
             newly_online, _ = self.poll_online_statuses(list(pending))
 
             for p in newly_online:
@@ -2101,6 +2223,9 @@ class StageManager:
             elapsed = time.monotonic() - start
             if elapsed > timeout:
                 raise TimeoutError(f"staging timed out after {fmt_duration(elapsed)}")
+            failures = self.poll_stage_request_errors(list(self._pin_requests), set(candidates))
+            if failures:
+                raise RuntimeError("staging failed: " + "; ".join(failures.values()))
             online, _ = self.poll_online_statuses(candidates)
             if online:
                 self.deadline = None
