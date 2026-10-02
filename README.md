@@ -121,23 +121,32 @@ When `dcache_cp` resolves `~/macaroons/dcache.conf`, it also checks for
 1. Enumerate local files
 2. For each file (parallel, `--workers` threads):
    - Skip if remote checksum already matches (`--no-skip-verified` to disable)
-   - `rclone copyto` local → remote
-   - Fetch remote Adler-32 via `ada --checksum`
-   - Retry on mismatch (up to `--max-retries`)
+   - Copy to a unique temporary remote file using `rclone copyto --ignore-times`
+   - Verify Adler-32 and confirm the local source is unchanged
+   - Promote the verified temporary copy with `rclone moveto --ignore-times --no-check-dest`
+   - Retry failed copies or verification (up to `--max-retries`)
+
+Existing destinations survive copy and verification failures. Cleanup removes
+only the temporary copy. If upload promotion fails, any remaining verified
+temporary file is retained and its path is reported for recovery.
+Allow space for a complete temporary copy alongside an existing destination.
+Interrupted transfers may leave temporary files; inspect them before removing
+them or retrying, and retain the source until verification succeeds.
 
 ### Download flow
 
 1. Enumerate remote files via `rclone lsjson`
-2. If `--skip-verified` is enabled, compare existing local files against remote
+2. Unless `--no-skip-verified` is set, compare existing local files against remote
   checksums first and skip already verified files before staging them
 3. Process in batches of `--stage-batch` (default 10000, also limited by `--stage-batch-bytes`) to avoid exceeding staging area:
    - **Stage** the batch via `ada --stage --from-file`
-  - If the dCache API reports per-file stage failures, `dcache_cp` falls back to
+  - If the initial ADA stage command or a per-file stage request fails, `dcache_cp` falls back to
     authenticated 1-byte WebDAV reads to trigger dCache's normal on-read staging
     path for those files
    - **Poll** each file; as soon as a file is ONLINE, start downloading it immediately
-   - **Download** in parallel with `rclone copyto`, verify Adler-32
-  - **Destage** each file as soon as its download has been verified
+   - **Download** in parallel to unique local temporary files, verify Adler-32,
+     then atomically replace the final filenames
+  - **Destage** the batch after its downloads finish, before staging another batch
 4. Repeat for the next batch
 
 This pipeline approach means the staging area only holds one batch at a time,
@@ -145,7 +154,13 @@ so it works even when the total dataset is larger than the available staging
 space.
 
 Use `--no-stage` if files are already online.  Use `--no-destage` to keep
-them pinned.
+them pinned. With `--no-destage`, the entire retained set must fit the configured
+file and byte limits. A file larger than `--stage-batch-bytes` is rejected before
+staging; increase the limit explicitly. Failed pin release prevents the next batch.
+
+Each unique remote source is staged once per batch. Copy requests for that source
+to several local destinations are all preserved. Bearer tokens are passed to curl
+through owner-only temporary header files rather than command-line arguments.
 
 ### Move flow
 
@@ -154,6 +169,11 @@ source only after the copy has been checksum-verified.
 
 - Upload move: verified upload, then delete the local source file
 - Download move: verified download, then delete the remote source file
+- Moves use fresh local checksums and recheck source identity/content immediately
+  before deletion. Keep move inputs quiescent: external writers must not modify
+  the source or destination while a move is running.
+- A file symlink upload copies its target and removes only the requested link.
+  Moving through a directory symlink is rejected; select its explicit target.
 - Recursive moves delete transferred source files, but do not remove now-empty
   source directories
 - In `--file-list` mode, resumed move rows are skipped when the source is
@@ -178,6 +198,18 @@ Rules:
 - Exactly one column must have a remote prefix (e.g. `dcache:`)
 - All rows must be the same direction (all uploads or all downloads)
 - Lines starting with `#` are comments; blank lines are skipped
+- Quoted TSV fields are supported; exactly two columns are required
+- Every destination must be unique, with no overlapping file/child paths
+- Use one remote prefix per invocation. A move source may appear only once;
+  copy it to all required destinations before moving it
+
+`--remote` selects the same config section for rclone and ADA. Both literal
+`bearer_token` and `bearer_token_command` configurations are supported; ADA gets
+only the selected token in an owner-only temporary config. Percent-encoded URLs
+are read literally. `--ada` and help/version output do not trigger default ADA
+resolution or downloads. Metadata commands have a 120-second bound, and checksum
+and staging calls also respect their remaining command deadlines. Cancellation
+stops queued work and terminates active subprocess groups.
 
 ```bash
 dcache_cp --file-list transfers.tsv
@@ -220,6 +252,7 @@ options:
   --no-stage           Skip staging (download only)
   --no-destage         Keep files staged after download
   --stage-batch N      Files to stage per batch (default: 10000)
+  --stage-batch-bytes N Max staged bytes (default: 5497558138880 = 5 TiB)
   --stage-timeout SEC  Max wait for staging (default: 86400 = 24h)
   --stage-poll SEC     Poll interval for staging (default: 60)
   --stage-lifetime DUR Pin lifetime (default: 7D)
@@ -275,7 +308,7 @@ and Adler-32 checksums.
 dcache_ls dcache:/data/
 
 # Long format with human-readable sizes
-dcache_ls -lh dcache:/data/
+dcache_ls -lH dcache:/data/
 
 # Show pin lifetime and locality
 dcache_ls -l --pin dcache:/data/
