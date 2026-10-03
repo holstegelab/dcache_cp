@@ -181,6 +181,49 @@ dcache_cp ./data/ dcache:/archive/data/ -R --quota-pool agh_rwtapepools
 The progress bar will show available space, pinned capacity, and totals.
 The final summary also prints the current quota state.
 
+### Bundling small files
+
+When uploading directories with many small files, `--bundle-small-files` packs
+eligible files into SquashFS archives before uploading.  This dramatically
+reduces the number of physical objects on dCache (and therefore tape overhead)
+while keeping the logical file structure intact.
+
+```bash
+# Upload with bundling
+dcache_cp ./many_small_files/ dcache:/archive/run42/ -R --bundle-small-files
+
+# Multiple source directories (each bundled independently)
+dcache_cp ./dir1/ ./dir2/ dcache:/archive/ -R --bundle-small-files
+
+# Download transparently unpacks bundles back to individual files
+dcache_cp dcache:/archive/run42/ ./local_copy/ -R
+```
+
+How it works:
+
+1. Files smaller than `--bundle-max-file-size` (default 64 MiB) in directories
+   whose total exceeds `--bundle-min-dir-total` (default 256 MiB) are grouped
+   into SquashFS bundles (zstd compressed, 1 MiB blocks)
+2. Bundle metadata is stored as dCache extended attributes (xattrs) on both the
+   anchor directory and the bundle object — no sidecar database needed
+3. Re-running the same upload is incremental: unchanged bundles are reused,
+   only new/modified files produce new bundle generations
+4. Downloads transparently read bundle xattrs and extract individual members,
+   either via sparse reads or full bundle download + local extraction
+5. `dcache_ls` shows bundled files as logical members under a `bundles:` section
+
+Bundling options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--bundle-small-files` | off | Enable bundling for uploads |
+| `--bundle-target-size SIZE` | 1GiB | Target uncompressed bytes per bundle |
+| `--bundle-max-file-size SIZE` | 64MiB | Max file size eligible for bundling |
+| `--bundle-min-dir-total SIZE` | 256MiB | Min directory total before bundling activates |
+| `--bundle-max-members N` | 10000 | Max members per bundle |
+| `--no-unpack-bundles` | off | Download raw `.dcpbundle` objects without unpacking |
+| `--ignore-bundle-xattrs` | off | Ignore bundle xattrs, treat as plain files |
+
 ## Options
 
 ```
@@ -202,6 +245,13 @@ options:
   --retry-wait SEC     Seconds between retries (default: 60)
   --copy-timeout VAL   rclone idle --timeout value (default: 300m)
   --checksum-timeout N Max seconds to wait for dCache checksum (default: 14400 = 4h)
+  --bundle-small-files Bundle small files into SquashFS archives on upload
+  --bundle-target-size Target bytes per bundle (default: 1GiB)
+  --bundle-max-file-size Max file size for bundling (default: 64MiB)
+  --bundle-min-dir-total Min dir total to activate bundling (default: 256MiB)
+  --bundle-max-members Max members per bundle (default: 10000)
+  --no-unpack-bundles  Download raw bundle objects without unpacking
+  --ignore-bundle-xattrs Ignore bundle xattrs, treat remote as plain files
   --no-stage           Skip staging (download only)
   --no-destage         Keep files staged after download
   --stage-batch N      Files to stage per batch (default: 10000)
@@ -260,7 +310,7 @@ and Adler-32 checksums.
 dcache_ls dcache:/data/
 
 # Long format with human-readable sizes
-dcache_ls -lh dcache:/data/
+dcache_ls -lH dcache:/data/
 
 # Show pin lifetime and locality
 dcache_ls -l --pin dcache:/data/
@@ -270,7 +320,23 @@ dcache_ls -lR --checksum dcache:/data/
 
 # Custom prefix (uses ~/macaroons/analysis.conf)
 dcache_ls -l analysis:/archive/run42/
+
+# Hide bundle-aware listing (physical files only)
+dcache_ls --no-bundles dcache:/data/
+
+# Reveal logically deleted bundle members
+dcache_ls --show-deleted-bundles dcache:/data/
 ```
+
+### Bundle awareness
+
+When a directory contains bundled files (uploaded with `--bundle-small-files`),
+`dcache_ls` automatically resolves bundle xattrs and shows logical members
+grouped by bundle object under a `bundles:` section.  Members that have been
+deprecated (superseded by a newer generation) are shown by default with a
+`[deprecated]` tag and a per-bundle health summary.  Logically deleted members
+stay hidden unless `--show-deleted-bundles` is passed, in which case they are
+shown with a `[deleted]` tag.
 
 ### Output
 
@@ -283,6 +349,7 @@ and file name — just like `ls -l`.  Extra columns are added with flags:
 | `--pin` | pin | Pin/staging lifetime remaining |
 | `--checksum` | checksum | Adler-32 checksum (one API call per file) |
 | `--no-locality` | | Hide the locality column |
+| `--show-deleted-bundles` | | Reveal logically deleted bundle members in bundle-aware output |
 
 Directories are shown in bold blue, symlinks in cyan.  ONLINE files
 are green, NEARLINE files are yellow.  Colors respect `NO_COLOR` and
@@ -299,12 +366,16 @@ positional arguments:
 
 options:
   -l, --long           Long listing format
-  -h, --human-readable Human-readable sizes (e.g. 1.5GiB)
+  -H, --human-readable Human-readable sizes (e.g. 1.5GiB)
   -R, --recursive      List directories recursively
   --pin                Show pin/staging lifetime column
   --locality           Show file locality column (default with -l)
   --no-locality        Hide file locality column
   --checksum           Show Adler-32 checksum column
+  --bundles            Show bundle-aware logical members (default)
+  --no-bundles         Hide bundle-aware logical members
+  --show-deleted-bundles
+                       Reveal logically deleted bundle members in bundle-aware output
   --config PATH        rclone config file override
   --remote NAME        rclone remote name
   --ada CMD            ada executable (default: ada or $ADA)

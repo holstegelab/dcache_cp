@@ -35,6 +35,7 @@ import queue
 import random
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,37 @@ import zlib
 from pathlib import Path
 
 from . import __version__
+from .tempfiles import get_temp_root, mkdtemp as dcache_mkdtemp, named_tempfile
+from .bundles import (
+    DEFAULT_BUNDLE_FORMAT,
+    DEFAULT_BUNDLE_MAX_FILE_SIZE,
+    DEFAULT_BUNDLE_MAX_MEMBERS,
+    DEFAULT_BUNDLE_MIN_DIR_TOTAL,
+    DEFAULT_BUNDLE_TARGET_SIZE,
+    BundleOptions,
+    BundleDeprecationPlan,
+    BundleDeprecationRecord,
+    BundleDeletedRecord,
+    BundleMember,
+    BundleMemberMetadata,
+    AnchorBundlePlan,
+    BundleUploadPlan,
+    build_anchor_xattrs_for_routes,
+    build_bundle_deleted_xattrs,
+    build_bundle_deprecated_xattrs,
+    build_bundle_member,
+    bundle_object_remote_path,
+    build_anchor_xattrs,
+    decode_bundle_deleted,
+    decode_bundle_deprecated,
+    decode_anchor_routes,
+    decode_bundle_members,
+    make_bundle_generation,
+    materialize_bundle_job,
+    plan_anchor_bundle_jobs,
+    plan_bundle_anchor_groups,
+)
+from .xattrs import NamespaceXattrClient, NamespaceXattrError, extract_bearer_token
 
 LOG = logging.getLogger("dcache_cp")
 
@@ -70,7 +102,7 @@ _ADA_CHECK_INTERVAL = 86400  # seconds — recheck GitHub once per day
 # Candidate directories for caching ada, tried in order.
 _ADA_CACHE_DIRS = [
     Path("~/.local/share/dcache_cp").expanduser(),
-    Path(os.environ.get("TMPDIR", "/tmp")) / f"dcache_cp_{os.getenv('USER', 'user')}",
+    get_temp_root() / f"dcache_cp_{os.getenv('USER', 'user')}",
     Path.cwd() / ".dcache_cp",
 ]
 
@@ -206,6 +238,44 @@ def format_bytes(value: int) -> str:
                 return f"{int(size)}{unit}"
             return f"{size:.1f}{unit}"
         size /= 1024
+
+
+_SIZE_LITERAL_RE = re.compile(r"^\s*(\d+)\s*([kmgtp]?i?b?)?\s*$", re.IGNORECASE)
+
+
+def parse_size_literal(value: str) -> int:
+    match = _SIZE_LITERAL_RE.match(str(value))
+    if not match:
+        raise argparse.ArgumentTypeError(f"invalid size literal: {value!r}")
+    amount = int(match.group(1))
+    suffix = (match.group(2) or "").lower()
+    multipliers = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "ki": 1024,
+        "kib": 1024,
+        "m": 1024 ** 2,
+        "mb": 1024 ** 2,
+        "mi": 1024 ** 2,
+        "mib": 1024 ** 2,
+        "g": 1024 ** 3,
+        "gb": 1024 ** 3,
+        "gi": 1024 ** 3,
+        "gib": 1024 ** 3,
+        "t": 1024 ** 4,
+        "tb": 1024 ** 4,
+        "ti": 1024 ** 4,
+        "tib": 1024 ** 4,
+        "p": 1024 ** 5,
+        "pb": 1024 ** 5,
+        "pi": 1024 ** 5,
+        "pib": 1024 ** 5,
+    }
+    if suffix not in multipliers:
+        raise argparse.ArgumentTypeError(f"invalid size suffix in {value!r}")
+    return amount * multipliers[suffix]
 
 
 def fmt_duration(seconds: float) -> str:
@@ -375,12 +445,56 @@ def resolve_remote_name(parser: configparser.ConfigParser, requested: str | None
     raise ValueError("--remote required when config has multiple remotes: " + ", ".join(sections))
 
 
+def _read_shell_config_value(path: Path, key: str) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if name.strip() != key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value.strip() or None
+    return None
+
+
+def _read_ada_default_api() -> str | None:
+    vendor_default = Path(__file__).resolve().parent / "vendor" / "etc" / "ada.conf"
+    candidates = [vendor_default, Path("/etc/ada.conf"), Path.home() / ".ada" / "ada.conf"]
+    api: str | None = None
+    for candidate in candidates:
+        value = _read_shell_config_value(candidate, "api")
+        if value:
+            api = value
+    return api
+
+
+def _infer_api_url_from_remote(remote_cfg: configparser.SectionProxy) -> str | None:
+    webdav_url = (remote_cfg.get("url", fallback=None) or "").strip()
+    if not webdav_url:
+        return None
+    parsed = urllib.parse.urlsplit(webdav_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/api/v1", "", ""))
+
+
 def resolve_api_url(explicit: str | None, remote_cfg: configparser.SectionProxy) -> str | None:
     return (
         explicit
         or os.environ.get("DCACHE_API")
         or os.environ.get("ADA_API")
+        or os.environ.get("ada_api")
         or remote_cfg.get("api", fallback=None)
+        or _read_ada_default_api()
+        or _infer_api_url_from_remote(remote_cfg)
     )
 
 
@@ -388,15 +502,24 @@ def resolve_api_url(explicit: str | None, remote_cfg: configparser.SectionProxy)
 # Shell commands
 # ---------------------------------------------------------------------------
 
-def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+def run_command(cmd: list[str], check: bool = True,
+                log_errors: bool = True) -> subprocess.CompletedProcess:
+    """Run a subprocess and return its result.
+
+    *log_errors*: when True (default), log stdout/stderr at ERROR on failure.
+    Set to False when the caller expects and handles certain non-zero exits
+    (e.g. rclone lsjson on missing bundled dirs, ada 429 rate-limits) to
+    avoid spurious ERROR lines.
+    """
     LOG.debug("cmd: %s", " ".join(shlex.quote(str(x)) for x in cmd))
     try:
         result = subprocess.run(cmd, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except subprocess.CalledProcessError as exc:
+        level = logging.ERROR if log_errors else logging.DEBUG
         if exc.stdout:
-            LOG.error("stdout: %s", exc.stdout.strip())
+            LOG.log(level, "stdout: %s", exc.stdout.strip())
         if exc.stderr:
-            LOG.error("stderr: %s", exc.stderr.strip())
+            LOG.log(level, "stderr: %s", exc.stderr.strip())
         raise
     if result.stdout:
         LOG.debug("stdout: %s", result.stdout.strip())
@@ -445,6 +568,12 @@ def _redact_http_secrets(text: str) -> str:
     return redacted
 
 
+def _ada_tokenfile_cmd(ada_cmd: str, tokenfile: Path, api: str | None) -> list[str]:
+    cmd = [ada_cmd, "--tokenfile", str(tokenfile)]
+    # When ada already has a tokenfile, let it resolve the matching API itself.
+    return cmd
+
+
 def _ada_reports_missing_path(output: str) -> bool:
     """Return True when ada output indicates the target path does not exist."""
     text = output.lower()
@@ -456,6 +585,32 @@ def _ada_reports_missing_path(output: str) -> bool:
         "could not determine type of object",
     )
     return all(marker in text for marker in markers[:2]) or any(marker in text for marker in markers[2:])
+
+
+def _ada_reports_transient_transport_error(output: str) -> bool:
+    """Return True when ada/curl output looks like a retryable transport issue."""
+    text = output.lower()
+    markers = (
+        "curl: (6)",
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "curl: (7)",
+        "failed to connect",
+        "connection refused",
+        "network is unreachable",
+        "curl: (28)",
+        "operation timed out",
+        "connection timed out",
+        "timeout was reached",
+        "curl: (52)",
+        "empty reply from server",
+        "curl: (55)",
+        "send failure",
+        "curl: (56)",
+        "recv failure",
+        "failure when receiving data from the peer",
+    )
+    return any(marker in text for marker in markers)
 
 
 def normalize_adler(value: str) -> str:
@@ -778,7 +933,7 @@ def _rclone_lsjson(
     if recursive:
         cmd.append("--recursive")
 
-    result = run_command(cmd, check=not missing_ok)
+    result = run_command(cmd, check=not missing_ok, log_errors=False)
     if result.returncode != 0:
         if missing_ok:
             return []
@@ -787,6 +942,46 @@ def _rclone_lsjson(
     if not isinstance(entries, list):
         raise ValueError(f"unexpected lsjson output for {target}")
     return entries
+
+
+def _rclone_path_is_file(rclone_config: Path, remote: str, remote_path: str) -> bool:
+    """Return True if ``remote_path`` is a regular file (not a directory).
+
+    Uses ``rclone lsjson --stat`` which describes the path *itself*: a file
+    yields ``IsDir=false`` with ``Path`` set to its basename, a directory yields
+    ``IsDir=true`` with an empty ``Path``.  Used to disambiguate a single-file
+    source from a directory whose one child happens to share its name.
+    """
+    remote_path = remote_path.strip("/")
+    target = f"{remote}:{remote_path}" if remote_path else f"{remote}:"
+    cmd = [
+        "rclone", "--config", str(rclone_config),
+        "lsjson", "--stat", target,
+    ]
+    result = run_command(cmd, check=False, log_errors=False)
+    if result.returncode != 0:
+        return False
+    try:
+        info = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(info, dict) and not info.get("IsDir", True)
+
+
+def _rclone_lsjson_reports_missing_path(exc: subprocess.CalledProcessError) -> bool:
+    text = "\n".join(
+        part.strip()
+        for part in (exc.stdout, exc.stderr)
+        if isinstance(part, str) and part.strip()
+    ).lower()
+    return any(
+        needle in text
+        for needle in (
+            "directory not found",
+            "object not found",
+            "file not found",
+        )
+    )
 
 
 def _fill_file_list_download_sizes(
@@ -931,7 +1126,7 @@ def plan_upload(source: Path, destination: str, recursive: bool,
         rel = str(path.relative_to(source)).replace(os.sep, "/")
         st = resolved.stat()
         out.append({"source": path, "resolved_source": resolved, "rel": rel,
-                     "size": st.st_size, "remote_path": posixpath.join(root, rel)})
+                     "size": st.st_size, "remote_path": posixpath.join(root, rel), "bundle_root": root})
         if spinner:
             spinner.tick()
     return out
@@ -953,13 +1148,25 @@ def plan_download(
     if not entries:
         raise FileNotFoundError(f"no files found at remote path: {remote_path}")
 
+    # ``rclone lsjson`` on a *file* returns a single non-dir entry whose ``Path``
+    # is the file's own basename.  In that case ``remote_path`` already is the
+    # full file path, so joining it with the basename would yield ``<file>/<file>``
+    # and a 404.  Confirm with an explicit stat to avoid mis-detecting a directory
+    # that contains exactly one equally-named child file.
+    source_is_file = (
+        len(entries) == 1
+        and not entries[0].get("IsDir", False)
+        and entries[0].get("Path") == posixpath.basename(remote_path)
+        and _rclone_path_is_file(rclone_config, remote, remote_path)
+    )
+
     out: list[dict] = []
     for entry in entries:
         if entry.get("IsDir", False):
             continue
         rel = entry["Path"]
         size = entry.get("Size", 0)
-        file_remote = posixpath.join(remote_path, rel)
+        file_remote = remote_path if source_is_file else posixpath.join(remote_path, rel)
         local_target = local_dest / rel
         out.append({
             "remote_path": file_remote,
@@ -976,6 +1183,730 @@ def plan_download(
         raise FileNotFoundError(f"no files found at remote path: {remote_path}")
 
     return out
+
+
+def _bundle_members_for_entry(entry: dict) -> list[dict]:
+    members = entry.get("bundle_members")
+    if isinstance(members, list):
+        return members
+    if isinstance(members, tuple):
+        return list(members)
+    return []
+
+
+def _entry_logical_file_count(entry: dict) -> int:
+    bundle_members = _bundle_members_for_entry(entry)
+    return len(bundle_members) if bundle_members else 1
+
+
+def _entry_logical_bytes(entry: dict) -> int:
+    bundle_members = _bundle_members_for_entry(entry)
+    if bundle_members:
+        return sum(int(member.get("size", 0)) for member in bundle_members)
+    return int(entry.get("size", 0))
+
+
+def _entry_stage_bytes(entry: dict) -> int:
+    return max(int(entry.get("stage_size", entry.get("size", 0))), 0)
+
+
+def _bundle_member_matches_remote(local_member: BundleMember, remote_member: BundleMemberMetadata) -> bool:
+    return (
+        local_member.anchor_rel == remote_member.anchor_rel
+        and normalize_adler(local_member.adler32) == normalize_adler(remote_member.adler32)
+        and local_member.size == remote_member.size
+        and local_member.mtime_ns == remote_member.mtime_ns
+        and local_member.mode == remote_member.mode
+    )
+
+
+class _BundleUploadResolver:
+    def __init__(
+        self,
+        rclone_config: Path,
+        remote: str,
+        api: str | None,
+        remote_cfg: configparser.SectionProxy | None,
+    ):
+        self.rclone_config = rclone_config
+        self.remote = remote
+        self.api = api
+        self.remote_cfg = remote_cfg
+        self.xattr_client: NamespaceXattrClient | None = None
+        self._anchor_state_cache: dict[str, tuple[str | None, dict[str, str]]] = {}
+        self._bundle_state_cache: dict[str, dict[str, object] | None] = {}
+
+    def _require_client(self) -> NamespaceXattrClient:
+        if self.xattr_client is None:
+            if not self.api:
+                raise RuntimeError(
+                    "bundled uploads require a resolved dCache API URL"
+                )
+            token = extract_bearer_token(self.remote_cfg, self.rclone_config)
+            if not token:
+                raise RuntimeError(
+                    "bundled uploads require a bearer token in the selected config"
+                )
+            self.xattr_client = NamespaceXattrClient(self.api, token)
+        return self.xattr_client
+
+    def anchor_state(self, anchor_dir: str) -> tuple[str | None, dict[str, str]]:
+        anchor_dir = str(anchor_dir).strip("/")
+        if anchor_dir in self._anchor_state_cache:
+            generation, routes = self._anchor_state_cache[anchor_dir]
+            return generation, dict(routes)
+
+        try:
+            xattrs = self._require_client().list_xattrs(anchor_dir)
+        except NamespaceXattrError as exc:
+            if exc.status == 404:
+                self._anchor_state_cache[anchor_dir] = (None, {})
+                return None, {}
+            raise
+
+        generation = xattrs.get("dcache_cp.bundle_anchor.active_generation")
+        routes = decode_anchor_routes(xattrs)
+        self._anchor_state_cache[anchor_dir] = (generation, routes)
+        return generation, dict(routes)
+
+    def bundle_state_by_remote_path(self, remote_path: str) -> dict[str, object] | None:
+        remote_path = str(remote_path).strip("/")
+        if remote_path in self._bundle_state_cache:
+            cached = self._bundle_state_cache[remote_path]
+            return dict(cached) if isinstance(cached, dict) else None
+
+        try:
+            xattrs = self._require_client().list_xattrs(remote_path)
+        except NamespaceXattrError as exc:
+            if exc.status == 404:
+                self._bundle_state_cache[remote_path] = None
+                return None
+            raise
+
+        state: dict[str, object] = {
+            "remote_path": remote_path,
+            "bundle_id": xattrs.get("dcache_cp.bundle.id") or Path(remote_path).stem,
+            "anchor_dir": xattrs.get("dcache_cp.bundle.anchor_dir") or _bundle_anchor_dir_from_object(remote_path) or "",
+            "format": xattrs.get("dcache_cp.bundle.format") or DEFAULT_BUNDLE_FORMAT,
+            "members": decode_bundle_members(xattrs),
+            "deleted": decode_bundle_deleted(xattrs),
+            "deprecated": decode_bundle_deprecated(xattrs),
+            "xattrs": xattrs,
+        }
+        self._bundle_state_cache[remote_path] = state
+        return dict(state)
+
+    def bundle_details(self, anchor_dir: str, bundle_id: str) -> dict[str, object] | None:
+        return self.bundle_state_by_remote_path(bundle_object_remote_path(anchor_dir, bundle_id))
+
+    def resolve_existing_route(self, remote_path: str) -> dict[str, str] | None:
+        remote_path = str(remote_path).strip("/")
+        if _is_bundle_object_path(remote_path):
+            return None
+        for anchor_dir in _candidate_anchor_dirs_for_remote_path(remote_path):
+            _, routes = self.anchor_state(anchor_dir)
+            anchor_rel = posixpath.relpath(remote_path, anchor_dir) if anchor_dir else remote_path
+            bundle_id = routes.get(anchor_rel)
+            if bundle_id:
+                return {
+                    "anchor_dir": anchor_dir,
+                    "anchor_rel": anchor_rel,
+                    "bundle_id": bundle_id,
+                }
+        return None
+
+    def preferred_anchor_for_directory(self, remote_dir: str) -> str | None:
+        remote_dir = str(remote_dir).strip("/")
+        probe_path = posixpath.join(remote_dir, ".dcache-cp-anchor-probe") if remote_dir else ".dcache-cp-anchor-probe"
+        for anchor_dir in _candidate_anchor_dirs_for_remote_path(probe_path):
+            _, routes = self.anchor_state(anchor_dir)
+            if not routes:
+                continue
+            dir_rel = posixpath.relpath(remote_dir, anchor_dir) if anchor_dir else remote_dir
+            if dir_rel in {"", "."}:
+                return anchor_dir
+            prefix = dir_rel.strip("/") + "/"
+            if any(route.startswith(prefix) for route in routes):
+                return anchor_dir
+        return None
+
+
+def _entry_transfer_root(entry: dict) -> str:
+    bundle_root = entry.get("bundle_root")
+    if bundle_root is not None:
+        return str(bundle_root).strip("/")
+    return posixpath.dirname(str(entry["remote_path"]).strip("/"))
+
+
+def _bundle_transfer_roots(files: list[dict]) -> set[str]:
+    return {_entry_transfer_root(entry) for entry in files}
+
+
+def _build_incremental_anchor_bundle_plan(
+    anchor_dir: str,
+    anchor_entries: list[dict],
+    options: BundleOptions,
+    resolver: _BundleUploadResolver,
+) -> AnchorBundlePlan | None:
+    existing_generation, existing_routes = resolver.anchor_state(anchor_dir)
+    existing_route_map = dict(existing_routes)
+
+    reused_members: list[BundleMember] = []
+    changed_entries: list[dict] = []
+    overridden_bundle_ids: dict[str, str] = {}
+    for entry in sorted(anchor_entries, key=lambda item: str(item["remote_path"])):
+        local_member = build_bundle_member(entry, anchor_dir=anchor_dir)
+        current_bundle_id = existing_route_map.get(local_member.anchor_rel)
+        if current_bundle_id:
+            details = resolver.bundle_details(anchor_dir, current_bundle_id)
+            remote_member = details["members"].get(local_member.anchor_rel) if details else None
+            if isinstance(remote_member, BundleMemberMetadata) and _bundle_member_matches_remote(local_member, remote_member):
+                reused_members.append(local_member)
+                continue
+            overridden_bundle_ids[local_member.anchor_rel] = current_bundle_id
+        changed_entries.append(entry)
+
+    generation = existing_generation or make_bundle_generation()
+    route_map = dict(existing_route_map)
+    new_bundles: tuple[object, ...] = ()
+    deprecations: list[BundleDeprecationPlan] = []
+    commit_required = False
+    if changed_entries:
+        generation = make_bundle_generation()
+        new_bundles = plan_anchor_bundle_jobs(anchor_dir, changed_entries, options, generation=generation)
+        for bundle in new_bundles:
+            for member in bundle.members:
+                route_map[member.anchor_rel] = bundle.bundle_id
+
+        deprecations_by_bundle_id: dict[str, list[BundleDeprecationRecord]] = {}
+        for anchor_rel, old_bundle_id in overridden_bundle_ids.items():
+            replacement_bundle_id = route_map.get(anchor_rel)
+            if replacement_bundle_id and replacement_bundle_id != old_bundle_id:
+                deprecations_by_bundle_id.setdefault(old_bundle_id, []).append(
+                    BundleDeprecationRecord(
+                        anchor_rel=anchor_rel,
+                        replacement_bundle_id=replacement_bundle_id,
+                        replacement_generation=generation,
+                    )
+                )
+        deprecations = [
+            BundleDeprecationPlan(
+                bundle_id=bundle_id,
+                remote_path=bundle_object_remote_path(anchor_dir, bundle_id),
+                members=tuple(sorted(records, key=lambda item: item.anchor_rel)),
+            )
+            for bundle_id, records in sorted(deprecations_by_bundle_id.items())
+        ]
+        commit_required = True
+
+    if not new_bundles and not reused_members:
+        return None
+
+    return AnchorBundlePlan(
+        anchor_dir=anchor_dir,
+        generation=generation,
+        bundles=tuple(new_bundles),
+        route_map=tuple(sorted(route_map.items())),
+        reused_members=tuple(reused_members),
+        deprecations=tuple(deprecations),
+        commit_required=commit_required,
+    )
+
+
+def _build_incremental_bundle_upload_plan(
+    files: list[dict],
+    options: BundleOptions,
+    resolver: _BundleUploadResolver,
+) -> BundleUploadPlan:
+    options.validate()
+    transfer_roots = _bundle_transfer_roots(files)
+    multiple_transfer_roots = len(transfer_roots) > 1
+    plain_entries: list[dict] = []
+    anchor_entries: dict[str, list[dict]] = {}
+    deferred_entries: list[dict] = []
+    conflicting_plain_paths: list[str] = []
+
+    for entry in sorted(files, key=lambda item: str(item["remote_path"])):
+        remote_path = str(entry["remote_path"]).strip("/")
+        source = Path(entry["resolved_source"])
+        transfer_root = _entry_transfer_root(entry)
+        existing_route = resolver.resolve_existing_route(remote_path)
+        if not source.is_file() or int(entry.get("size", 0)) > options.max_file_size:
+            if existing_route is not None:
+                conflicting_plain_paths.append(remote_path)
+                continue
+            plain_entries.append(entry)
+            continue
+
+        if existing_route is not None:
+            anchor_entries.setdefault(existing_route["anchor_dir"], []).append(entry)
+            continue
+
+        preferred_anchor = resolver.preferred_anchor_for_directory(posixpath.dirname(remote_path))
+        if preferred_anchor is not None:
+            if multiple_transfer_roots:
+                allow_preferred_anchor = (
+                    preferred_anchor == transfer_root
+                    or _remote_path_within(transfer_root, preferred_anchor)
+                )
+            else:
+                allow_preferred_anchor = (
+                    preferred_anchor == transfer_root
+                    or _remote_path_within(preferred_anchor, transfer_root)
+                    or _remote_path_within(transfer_root, preferred_anchor)
+                )
+            if allow_preferred_anchor:
+                anchor_entries.setdefault(preferred_anchor, []).append(entry)
+                continue
+        deferred_entries.append(entry)
+
+    deferred_plain_entries, deferred_anchor_groups = plan_bundle_anchor_groups(deferred_entries, options)
+    for entry in deferred_plain_entries:
+        existing_route = resolver.resolve_existing_route(entry["remote_path"])
+        if existing_route is not None:
+            conflicting_plain_paths.append(str(entry["remote_path"]).strip("/"))
+            continue
+        plain_entries.append(entry)
+
+    if conflicting_plain_paths:
+        preview = ", ".join(conflicting_plain_paths[:5])
+        suffix = "" if len(conflicting_plain_paths) <= 5 else f" (+{len(conflicting_plain_paths) - 5} more)"
+        raise ValueError(
+            f"bundled upload sync cannot replace existing bundled files with plain files: {preview}{suffix}"
+        )
+
+    for anchor_group in deferred_anchor_groups:
+        anchor_entries.setdefault(anchor_group.anchor_dir, []).extend(anchor_group.entries)
+
+    anchors: list[AnchorBundlePlan] = []
+    for anchor_dir, grouped_entries in sorted(anchor_entries.items(), key=lambda item: item[0]):
+        anchor_plan = _build_incremental_anchor_bundle_plan(anchor_dir, grouped_entries, options, resolver)
+        if anchor_plan is not None:
+            anchors.append(anchor_plan)
+
+    return BundleUploadPlan(
+        plain_entries=tuple(plain_entries),
+        anchors=tuple(anchors),
+    )
+
+
+def _is_bundle_object_path(remote_path: str) -> bool:
+    parts = [part for part in str(remote_path).strip("/").split("/") if part]
+    return len(parts) >= 3 and parts[-3] == ".dcpacks" and parts[-2] == "bundles" and parts[-1].endswith(".dcpbundle")
+
+
+def _bundle_anchor_dir_from_object(remote_path: str) -> str | None:
+    if not _is_bundle_object_path(remote_path):
+        return None
+    parts = [part for part in str(remote_path).strip("/").split("/") if part]
+    return "/".join(parts[:-3])
+
+
+def _remote_path_within(root: str, remote_path: str) -> bool:
+    clean_root = str(root).strip("/")
+    clean_path = str(remote_path).strip("/")
+    if not clean_root:
+        return True
+    return clean_path == clean_root or clean_path.startswith(clean_root + "/")
+
+
+def _candidate_anchor_dirs_for_remote_path(remote_path: str) -> list[str]:
+    clean = str(remote_path).strip("/")
+    current = posixpath.dirname(clean)
+    out: list[str] = []
+    while True:
+        out.append(current)
+        if not current:
+            return out
+        next_current = posixpath.dirname(current)
+        if next_current == current:
+            out.append("")
+            return out
+        current = next_current
+
+
+def _lookup_remote_file_size(rclone_config: Path, remote: str, remote_path: str) -> int:
+    remote_path = str(remote_path).strip("/")
+    parent = posixpath.dirname(remote_path)
+    name = posixpath.basename(remote_path)
+    entries = _rclone_lsjson(rclone_config, remote, parent, recursive=False)
+    for entry in entries:
+        if entry.get("IsDir", False):
+            continue
+        if entry.get("Path") == name:
+            return int(entry.get("Size", 0))
+    raise FileNotFoundError(f"remote file not found: {remote_path}")
+
+
+class _BundleDownloadResolver:
+    def __init__(
+        self,
+        rclone_config: Path,
+        remote: str,
+        api: str | None,
+        remote_cfg: configparser.SectionProxy | None,
+    ):
+        self.rclone_config = rclone_config
+        self.remote = remote
+        self.api = api
+        self.remote_cfg = remote_cfg
+        self.xattr_client: NamespaceXattrClient | None = None
+        self._anchor_routes_cache: dict[str, dict[str, str]] = {}
+        self._bundle_cache: dict[str, dict[str, object]] = {}
+        self._bundle_sizes: dict[str, int] = {}
+
+    def _require_client(self) -> NamespaceXattrClient:
+        if self.xattr_client is None:
+            if not self.api:
+                raise RuntimeError(
+                    "transparent bundle downloads require a resolved dCache API URL; "
+                    "use --no-unpack-bundles to download raw bundle objects"
+                )
+            token = extract_bearer_token(self.remote_cfg, self.rclone_config)
+            if not token:
+                raise RuntimeError(
+                    "transparent bundle downloads require a bearer token in the selected config; "
+                    "use --no-unpack-bundles to download raw bundle objects"
+                )
+            self.xattr_client = NamespaceXattrClient(self.api, token)
+        return self.xattr_client
+
+    def anchor_routes(self, anchor_dir: str) -> dict[str, str]:
+        anchor_dir = str(anchor_dir).strip("/")
+        if anchor_dir not in self._anchor_routes_cache:
+            try:
+                xattrs = self._require_client().list_xattrs(anchor_dir)
+            except NamespaceXattrError as exc:
+                if exc.status == 404:
+                    self._anchor_routes_cache[anchor_dir] = {}
+                else:
+                    raise
+            else:
+                self._anchor_routes_cache[anchor_dir] = decode_anchor_routes(xattrs)
+        return self._anchor_routes_cache[anchor_dir]
+
+    def bundle_details(
+        self,
+        anchor_dir: str,
+        bundle_id: str,
+        *,
+        bundle_size: int | None = None,
+    ) -> dict[str, object]:
+        anchor_dir = str(anchor_dir).strip("/")
+        bundle_remote_path = bundle_object_remote_path(anchor_dir, bundle_id)
+        if bundle_remote_path not in self._bundle_cache:
+            xattrs = self._require_client().list_xattrs(bundle_remote_path)
+            members = decode_bundle_members(xattrs)
+            self._bundle_cache[bundle_remote_path] = {
+                "anchor_dir": anchor_dir,
+                "bundle_id": bundle_id,
+                "remote_path": bundle_remote_path,
+                "format": xattrs.get("dcache_cp.bundle.format") or DEFAULT_BUNDLE_FORMAT,
+                "members": members,
+                "deleted": decode_bundle_deleted(xattrs),
+                "deprecated": decode_bundle_deprecated(xattrs),
+                "member_count": len(members),
+            }
+        if bundle_size is not None and bundle_remote_path not in self._bundle_sizes:
+            self._bundle_sizes[bundle_remote_path] = int(bundle_size)
+        if bundle_remote_path not in self._bundle_sizes:
+            self._bundle_sizes[bundle_remote_path] = _lookup_remote_file_size(
+                self.rclone_config,
+                self.remote,
+                bundle_remote_path,
+            )
+        details = dict(self._bundle_cache[bundle_remote_path])
+        details["size"] = self._bundle_sizes[bundle_remote_path]
+        return details
+
+    def resolve_logical_entry(self, entry: dict) -> dict[str, object] | None:
+        remote_path = str(entry["remote_path"]).strip("/")
+        if _is_bundle_object_path(remote_path):
+            return None
+        for anchor_dir in _candidate_anchor_dirs_for_remote_path(remote_path):
+            anchor_rel = posixpath.relpath(remote_path, anchor_dir) if anchor_dir else remote_path
+            routes = self.anchor_routes(anchor_dir)
+            bundle_id = routes.get(anchor_rel)
+            if not bundle_id:
+                continue
+            details = self.bundle_details(anchor_dir, bundle_id, bundle_size=entry.get("bundle_size"))
+            deleted = details.get("deleted")
+            if isinstance(deleted, dict) and anchor_rel in deleted:
+                continue
+            member = details["members"].get(anchor_rel)
+            if member is None:
+                raise RuntimeError(
+                    f"bundle xattrs for {details['remote_path']} do not contain requested member {anchor_rel!r}"
+                )
+            return {
+                "anchor_dir": anchor_dir,
+                "anchor_rel": anchor_rel,
+                "bundle_id": bundle_id,
+                "bundle_remote_path": details["remote_path"],
+                "bundle_format": details["format"],
+                "bundle_size": details["size"],
+                "bundle_member_total": details["member_count"],
+                "member": member,
+            }
+        return None
+
+
+def _add_bundle_download_request(
+    bundle_entries_by_remote: dict[str, dict],
+    request_entry: dict,
+    resolved: dict[str, object],
+) -> None:
+    bundle_remote_path = str(resolved["bundle_remote_path"])
+    bundle_entry = bundle_entries_by_remote.get(bundle_remote_path)
+    if bundle_entry is None:
+        bundle_entry = {
+            "rel": f"bundle:{bundle_remote_path}",
+            "remote_path": bundle_remote_path,
+            "size": 0,
+            "stage_size": int(resolved["bundle_size"]),
+            "bundle_id": str(resolved["bundle_id"]),
+            "bundle_anchor_dir": str(resolved["anchor_dir"]),
+            "bundle_format": str(resolved["bundle_format"]),
+            "bundle_member_total": int(resolved["bundle_member_total"]),
+            "bundle_members": [],
+            "_member_keys": set(),
+        }
+        bundle_entries_by_remote[bundle_remote_path] = bundle_entry
+
+    local_path = Path(request_entry["local_path"])
+    request_key = (str(request_entry["remote_path"]).strip("/"), str(local_path))
+    if request_key in bundle_entry["_member_keys"]:
+        return
+
+    member = resolved["member"]
+    bundle_entry["_member_keys"].add(request_key)
+    bundle_entry["bundle_members"].append({
+        "rel": str(request_entry["rel"]),
+        "remote_path": str(request_entry["remote_path"]).strip("/"),
+        "local_path": local_path,
+        "anchor_rel": str(resolved["anchor_rel"]),
+        "size": int(member.size),
+        "adler32": str(member.adler32),
+        "mtime_ns": int(member.mtime_ns),
+        "mode": int(member.mode),
+    })
+    bundle_entry["size"] += int(member.size)
+
+
+def _finalize_bundle_download_entries(bundle_entries_by_remote: dict[str, dict]) -> list[dict]:
+    out: list[dict] = []
+    for remote_path in sorted(bundle_entries_by_remote):
+        entry = bundle_entries_by_remote[remote_path]
+        entry["bundle_members"].sort(key=lambda member: (member["rel"], str(member["local_path"])))
+        entry.pop("_member_keys", None)
+        out.append(entry)
+    return out
+
+
+def _merge_bundle_download_entries(entries: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for entry in entries:
+        remote_path = str(entry["remote_path"])
+        current = merged.get(remote_path)
+        if current is None:
+            current = {
+                key: value
+                for key, value in entry.items()
+                if key != "bundle_members"
+            }
+            current["bundle_members"] = []
+            current["_member_keys"] = set()
+            current["size"] = 0
+            merged[remote_path] = current
+        for member in _bundle_members_for_entry(entry):
+            request_key = (str(member["remote_path"]), str(member["local_path"]))
+            if request_key in current["_member_keys"]:
+                continue
+            current["_member_keys"].add(request_key)
+            current["bundle_members"].append(member)
+            current["size"] += int(member.get("size", 0))
+    return _finalize_bundle_download_entries(merged)
+
+
+def _plan_file_list_downloads_with_bundles(
+    rclone_config: Path,
+    remote: str,
+    files: list[dict],
+    resolver: _BundleDownloadResolver,
+    *,
+    allow_resumed_move: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    grouped: dict[str, set[str]] = {}
+    for entry in files:
+        remote_path = str(entry["remote_path"]).strip("/")
+        parent = posixpath.dirname(remote_path)
+        name = posixpath.basename(remote_path)
+        grouped.setdefault(parent, set()).add(name)
+
+    dir_sizes: dict[str, dict[str, int]] = {}
+    for parent in grouped:
+        try:
+            dir_entries = _rclone_lsjson(
+                rclone_config,
+                remote,
+                parent,
+                recursive=False,
+                missing_ok=allow_resumed_move,
+            )
+        except subprocess.CalledProcessError as exc:
+            if not _rclone_lsjson_reports_missing_path(exc):
+                raise
+            LOG.debug(
+                "treating missing physical directory %s as empty during bundle-aware file-list planning",
+                parent or "/",
+            )
+            dir_entries = []
+        dir_sizes[parent] = {
+            str(dir_entry.get("Path")): int(dir_entry.get("Size", 0))
+            for dir_entry in dir_entries
+            if not dir_entry.get("IsDir", False) and isinstance(dir_entry.get("Path"), str)
+        }
+
+    plain_entries: list[dict] = []
+    bundle_entries_by_remote: dict[str, dict] = {}
+    missing: list[str] = []
+
+    for entry in files:
+        remote_path = str(entry["remote_path"]).strip("/")
+        parent = posixpath.dirname(remote_path)
+        name = posixpath.basename(remote_path)
+        if name in dir_sizes[parent]:
+            plain_entry = dict(entry)
+            plain_entry["size"] = dir_sizes[parent][name]
+            plain_entries.append(plain_entry)
+            continue
+        resolved = resolver.resolve_logical_entry(entry)
+        if allow_resumed_move and resolved is None and Path(entry["local_path"]).exists():
+            LOG.info("skip %s (already moved)", entry["rel"])
+            continue
+        if resolved is None:
+            missing.append(remote_path)
+            continue
+        _add_bundle_download_request(bundle_entries_by_remote, entry, resolved)
+
+    if missing:
+        preview = ", ".join(sorted(missing)[:5])
+        suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+        raise FileNotFoundError(f"remote file(s) not found in file list: {preview}{suffix}")
+
+    return plain_entries, _finalize_bundle_download_entries(bundle_entries_by_remote)
+
+
+def _plan_download_source_with_bundles(
+    rclone_config: Path,
+    remote: str,
+    remote_path: str,
+    local_dest: Path,
+    recursive: bool,
+    resolver: _BundleDownloadResolver,
+    spinner: "_EnumSpinner | None" = None,
+) -> tuple[list[dict], list[dict]]:
+    remote_path = str(remote_path).strip("/")
+    local_dest = local_dest.expanduser().resolve()
+
+    if not recursive:
+        try:
+            return plan_download(rclone_config, remote, remote_path, local_dest, recursive=False, spinner=spinner), []
+        except FileNotFoundError:
+            pass
+        except subprocess.CalledProcessError as exc:
+            if not _rclone_lsjson_reports_missing_path(exc):
+                raise
+            LOG.debug(
+                "treating missing physical path %s as a candidate logical bundle member",
+                remote_path or "/",
+            )
+
+        logical_entry = {
+            "remote_path": remote_path,
+            "local_path": local_dest,
+            "rel": posixpath.basename(remote_path),
+        }
+        resolved = resolver.resolve_logical_entry(logical_entry)
+        if resolved is None:
+            raise FileNotFoundError(f"remote file not found: {remote_path}")
+        bundle_entries_by_remote: dict[str, dict] = {}
+        _add_bundle_download_request(bundle_entries_by_remote, logical_entry, resolved)
+        if spinner:
+            spinner.tick()
+        return [], _finalize_bundle_download_entries(bundle_entries_by_remote)
+
+    physical_entries = plan_download(rclone_config, remote, remote_path, local_dest, recursive=True, spinner=spinner)
+    bundle_object_entries = {
+        str(entry["remote_path"]).strip("/"): entry
+        for entry in physical_entries
+        if _is_bundle_object_path(str(entry["remote_path"]).strip("/"))
+    }
+    if not bundle_object_entries:
+        return physical_entries, []
+
+    bundle_entries_by_remote: dict[str, dict] = {}
+    referenced_bundle_paths: set[str] = set()
+
+    candidate_anchor_dirs = sorted(
+        anchor_dir
+        for anchor_dir in {_bundle_anchor_dir_from_object(path) for path in bundle_object_entries}
+        if anchor_dir is not None
+    )
+
+    for anchor_dir in candidate_anchor_dirs:
+        routes = resolver.anchor_routes(anchor_dir)
+        if not routes:
+            continue
+        for anchor_rel, bundle_id in sorted(routes.items()):
+            logical_remote_path = posixpath.join(anchor_dir, anchor_rel) if anchor_dir else anchor_rel
+            if not _remote_path_within(remote_path, logical_remote_path):
+                continue
+            bundle_remote_path = bundle_object_remote_path(anchor_dir, bundle_id)
+            bundle_entry = bundle_object_entries.get(bundle_remote_path)
+            if bundle_entry is None:
+                raise FileNotFoundError(
+                    f"bundle object missing for logical path {logical_remote_path}: {bundle_remote_path}"
+                )
+            resolved = resolver.resolve_logical_entry({
+                "remote_path": logical_remote_path,
+                "local_path": local_dest / posixpath.relpath(logical_remote_path, remote_path),
+                "rel": posixpath.relpath(logical_remote_path, remote_path),
+                "bundle_size": int(bundle_entry.get("size", 0)),
+            })
+            if resolved is None:
+                continue
+            referenced_bundle_paths.add(bundle_remote_path)
+            _add_bundle_download_request(bundle_entries_by_remote, {
+                "remote_path": logical_remote_path,
+                "local_path": local_dest / posixpath.relpath(logical_remote_path, remote_path),
+                "rel": posixpath.relpath(logical_remote_path, remote_path),
+            }, resolved)
+
+    plain_entries = [
+        entry
+        for entry in physical_entries
+        if not _is_bundle_object_path(str(entry["remote_path"]).strip("/"))
+        or str(entry["remote_path"]).strip("/") not in referenced_bundle_paths
+    ]
+    return plain_entries, _finalize_bundle_download_entries(bundle_entries_by_remote)
+
+
+def _bundle_entry_fully_verified(entry: dict) -> bool:
+    bundle_members = _bundle_members_for_entry(entry)
+    if not bundle_members:
+        return False
+    for member in bundle_members:
+        local_path = Path(member["local_path"])
+        if not local_path.exists():
+            return False
+        try:
+            local_adler = adler32_local(local_path)
+        except Exception:
+            return False
+        if normalize_adler(local_adler) != normalize_adler(str(member["adler32"])):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1001,10 +1932,7 @@ class QuotaTracker:
 
     def refresh(self):
         """Fetch current quota from ada --space.  Non-fatal on failure."""
-        cmd = [self.ada_cmd, "--tokenfile", str(self.tokenfile)]
-        if self.api:
-            cmd += ["--api", self.api]
-        cmd += ["--space", self.poolgroup]
+        cmd = _ada_tokenfile_cmd(self.ada_cmd, self.tokenfile, self.api) + ["--space", self.poolgroup]
         result = run_command(cmd, check=False)
         if result.returncode != 0:
             with self.lock:
@@ -1518,10 +2446,7 @@ class StageManager:
         self._resolved_webdav_bearer_token = (self.webdav_bearer_token or "").strip() or None
 
     def _base_cmd(self) -> list[str]:
-        cmd = [self.ada_cmd, "--tokenfile", str(self.tokenfile)]
-        if self.api:
-            cmd += ["--api", self.api]
-        return cmd
+        return _ada_tokenfile_cmd(self.ada_cmd, self.tokenfile, self.api)
 
     def can_prime_via_webdav_range(self) -> bool:
         return bool(self.webdav_url and (self._resolved_webdav_bearer_token or self.webdav_bearer_token_command))
@@ -1681,7 +2606,7 @@ class StageManager:
         if not remote_paths:
             return []
         LOG.info("staging %d file(s) (lifetime %s) ...", len(remote_paths), lifetime)
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        with named_tempfile("w", suffix=".txt", delete=False) as fh:
             for p in remote_paths:
                 fh.write("/" + p.strip("/") + "\n")
             list_file = fh.name
@@ -1702,7 +2627,7 @@ class StageManager:
         """Release pins via ``ada --unstage --from-file``."""
         if not remote_paths:
             return
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        with named_tempfile("w", suffix=".txt", delete=False) as fh:
             for p in remote_paths:
                 fh.write("/" + p.strip("/") + "\n")
             list_file = fh.name
@@ -1957,9 +2882,103 @@ class Transferer:
         self.progress: Progress | None = None  # set by caller to enable status updates
         self._seen_dirs: set[str] = set()
         self._dirs_lock = threading.Lock()
+        self._bundle_mount_manager: _BundleMountManager | None = None
+        self._bundle_mount_lock = threading.Lock()
 
         if not self.rclone_config.exists():
             raise FileNotFoundError(f"rclone config does not exist: {self.rclone_config}")
+
+    def close(self) -> None:
+        with self._bundle_mount_lock:
+            manager = self._bundle_mount_manager
+            self._bundle_mount_manager = None
+        if manager is not None:
+            manager.close()
+
+    def _get_bundle_mount_manager(self) -> _BundleMountManager:
+        with self._bundle_mount_lock:
+            if self._bundle_mount_manager is None:
+                self._bundle_mount_manager = _BundleMountManager(self.rclone_config, self.remote)
+            return self._bundle_mount_manager
+
+    def _set_progress_status(self, status: str) -> None:
+        if self.progress:
+            self.progress.status = status
+
+    def _hash_local_adler(self, local_path: Path, *, display_name: str | None = None) -> str:
+        if display_name:
+            self._set_progress_status(f"hashing {display_name}")
+        try:
+            return adler32_local(local_path)
+        finally:
+            if display_name:
+                self._set_progress_status("")
+
+    def _fetch_remote_adler_with_status(self, remote_path: str, *, display_name: str | None = None) -> str:
+        if display_name:
+            self._set_progress_status(f"waiting checksum {display_name}")
+        try:
+            return self._remote_adler(remote_path)
+        finally:
+            if display_name:
+                self._set_progress_status("")
+
+    @staticmethod
+    def _adlers_match(local_adler: str, remote_adler: str) -> bool:
+        return normalize_adler(local_adler) == normalize_adler(remote_adler)
+
+    def _read_verified_adlers(
+        self,
+        local_path: Path,
+        remote_path: str,
+        *,
+        display_name: str,
+        local_adler: str | None = None,
+        overlap_local_hash: bool = False,
+    ) -> tuple[str, str]:
+        if overlap_local_hash and local_adler is None:
+            self._set_progress_status(f"hashing {display_name}")
+            wait_for_local_adler = _run_in_daemon_thread(
+                adler32_local,
+                local_path,
+                name=f"hash-{display_name}",
+            )
+            self._set_progress_status(f"waiting checksum {display_name}")
+            try:
+                remote_adler = self._remote_adler(remote_path)
+                local_adler = wait_for_local_adler()
+            finally:
+                self._set_progress_status("")
+            return local_adler, remote_adler
+
+        remote_adler = self._fetch_remote_adler_with_status(remote_path, display_name=display_name)
+        if local_adler is None:
+            local_adler = self._hash_local_adler(local_path, display_name=display_name)
+        return local_adler, remote_adler
+
+    @staticmethod
+    def _create_download_temp_path(local_path: Path) -> Path:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with named_tempfile(
+            prefix=f".{local_path.name}.",
+            suffix=".dcache_cp.part",
+            dir=local_path.parent,
+            delete=False,
+        ) as fh:
+            return Path(fh.name)
+
+    @staticmethod
+    def _create_bundle_temp_path(bundle_name: str) -> Path:
+        with named_tempfile(
+            prefix=f".{bundle_name}.",
+            suffix=".dcache_cp.bundle.part",
+            delete=False,
+        ) as fh:
+            return Path(fh.name)
+
+    @staticmethod
+    def _install_verified_download(temp_path: Path, local_path: Path) -> None:
+        os.replace(temp_path, local_path)
 
     # -- upload (local → dCache) -------------------------------------------
 
@@ -1977,14 +2996,12 @@ class Transferer:
         local_adler: str | None = None
         if self.skip_verified:
             try:
-                remote_adler = self._remote_adler(remote_path)
-                # Remote has a checksum — now compute local to compare.
-                if self.progress:
-                    self.progress.status = f"hashing {local_path.name}"
-                local_adler = adler32_local(local_path)
-                if self.progress:
-                    self.progress.status = ""
-                if normalize_adler(local_adler) == normalize_adler(remote_adler):
+                local_adler, remote_adler = self._read_verified_adlers(
+                    local_path,
+                    remote_path,
+                    display_name=local_path.name,
+                )
+                if self._adlers_match(local_adler, remote_adler):
                     self._delete_uploaded_source(entry)
                     LOG.debug("skip %s (verified)", rel)
                     return self._result(rel, remote_path, entry, local_adler, remote_adler, 0, True)
@@ -1992,9 +3009,6 @@ class Transferer:
                 LOG.debug("remote file missing for %s; uploading", rel)
             except Exception:
                 LOG.debug("remote checksum unavailable for %s; uploading", rel)
-            finally:
-                if self.progress:
-                    self.progress.status = ""
 
         for attempt in range(self.max_retries + 1):
             self._rclone_mkdir(remote_dir)
@@ -2003,30 +3017,13 @@ class Transferer:
             # Compute local hash concurrently in a thread so we don't add
             # extra wall-clock time on top of the checksum wait.
             try:
-                if local_adler is None:
-                    if self.progress:
-                        self.progress.status = f"hashing {local_path.name}"
-                    wait_for_local_adler = _run_in_daemon_thread(
-                        adler32_local,
-                        local_path,
-                        name=f"hash-{local_path.name}",
-                    )
-                    if self.progress:
-                        self.progress.status = f"waiting checksum {local_path.name}"
-                    try:
-                        remote_adler = self._remote_adler(remote_path)
-                        local_adler = wait_for_local_adler()
-                    finally:
-                        if self.progress:
-                            self.progress.status = ""
-                else:
-                    if self.progress:
-                        self.progress.status = f"waiting checksum {local_path.name}"
-                    try:
-                        remote_adler = self._remote_adler(remote_path)
-                    finally:
-                        if self.progress:
-                            self.progress.status = ""
+                local_adler, remote_adler = self._read_verified_adlers(
+                    local_path,
+                    remote_path,
+                    display_name=local_path.name,
+                    local_adler=local_adler,
+                    overlap_local_hash=(local_adler is None),
+                )
             except Exception as exc:
                 LOG.warning("verification failed %s: %s (attempt %d/%d)",
                             rel, exc, attempt + 1, self.max_retries + 1)
@@ -2040,7 +3037,7 @@ class Transferer:
                     continue
                 raise RuntimeError(f"verification failed for {rel}: {exc}") from exc
 
-            if normalize_adler(local_adler) == normalize_adler(remote_adler):
+            if self._adlers_match(local_adler, remote_adler):
                 self._delete_uploaded_source(entry)
                 return self._result(rel, remote_path, entry, local_adler, remote_adler, attempt + 1, False)
             LOG.warning("checksum mismatch %s: local=%s remote=%s (attempt %d/%d)",
@@ -2062,9 +3059,12 @@ class Transferer:
 
         if self.skip_verified and local_path.exists():
             try:
-                remote_adler = self._remote_adler(remote_path)
-                local_adler = adler32_local(local_path)
-                if normalize_adler(local_adler) == normalize_adler(remote_adler):
+                local_adler, remote_adler = self._read_verified_adlers(
+                    local_path,
+                    remote_path,
+                    display_name=local_path.name,
+                )
+                if self._adlers_match(local_adler, remote_adler):
                     self._delete_downloaded_source(remote_path)
                     LOG.debug("skip %s (verified)", rel)
                     return self._dl_result(rel, remote_path, local_path, size, local_adler, remote_adler, 0, True)
@@ -2072,29 +3072,264 @@ class Transferer:
                 LOG.debug("checksum comparison failed for %s; downloading", rel)
 
         for attempt in range(self.max_retries + 1):
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            self._rclone_copyto(f"{self.remote}:{remote_path}", str(local_path))
+            temp_local_path = self._create_download_temp_path(local_path)
             try:
-                remote_adler = self._remote_adler(remote_path)
-                local_adler = adler32_local(local_path)
+                self._rclone_copyto(f"{self.remote}:{remote_path}", str(temp_local_path))
+                local_adler, remote_adler = self._read_verified_adlers(
+                    temp_local_path,
+                    remote_path,
+                    display_name=local_path.name,
+                )
             except Exception as exc:
                 LOG.warning("verification failed %s: %s (attempt %d/%d)",
                             rel, exc, attempt + 1, self.max_retries + 1)
-                local_path.unlink(missing_ok=True)
+                temp_local_path.unlink(missing_ok=True)
                 if attempt < self.max_retries:
                     time.sleep(self.retry_wait)
                     continue
                 raise RuntimeError(f"verification failed for {rel}: {exc}") from exc
-            if normalize_adler(local_adler) == normalize_adler(remote_adler):
+
+            if self._adlers_match(local_adler, remote_adler):
+                try:
+                    self._install_verified_download(temp_local_path, local_path)
+                except Exception as exc:
+                    LOG.warning("download finalization failed %s: %s (attempt %d/%d)",
+                                rel, exc, attempt + 1, self.max_retries + 1)
+                    temp_local_path.unlink(missing_ok=True)
+                    if attempt < self.max_retries:
+                        time.sleep(self.retry_wait)
+                        continue
+                    raise RuntimeError(f"download finalization failed for {rel}: {exc}") from exc
                 self._delete_downloaded_source(remote_path)
                 return self._dl_result(rel, remote_path, local_path, size, local_adler, remote_adler, attempt + 1, False)
             LOG.warning("checksum mismatch %s: local=%s remote=%s (attempt %d/%d)",
                         rel, local_adler, remote_adler, attempt + 1, self.max_retries + 1)
-            local_path.unlink(missing_ok=True)
+            temp_local_path.unlink(missing_ok=True)
             if attempt < self.max_retries:
                 time.sleep(self.retry_wait)
 
         raise RuntimeError(f"checksum mismatch for {rel}: local={local_adler} remote={remote_adler}")
+
+    def _extract_bundle_members(
+        self,
+        bundle_path: Path,
+        bundle_members: list[dict],
+        *,
+        bundle_format: str,
+    ) -> list[tuple[Path, Path, dict]]:
+        if bundle_format != DEFAULT_BUNDLE_FORMAT:
+            raise RuntimeError(f"unsupported bundle format for extraction: {bundle_format}")
+        return self._extract_squashfs_bundle_members(bundle_path, bundle_members)
+
+    @staticmethod
+    def _should_try_sparse_bundle_read(entry: dict, bundle_members: list[dict], bundle_format: str) -> bool:
+        if bundle_format != DEFAULT_BUNDLE_FORMAT:
+            return False
+        if not _BundleMountManager.available():
+            return False
+        bundle_member_total = int(entry.get("bundle_member_total", len(bundle_members)))
+        if bundle_member_total <= len(bundle_members):
+            return False
+        requested_bytes = sum(int(member.get("size", 0)) for member in bundle_members)
+        bundle_size = int(entry.get("stage_size", entry.get("size", 0)))
+        if bundle_size > 0 and requested_bytes * 2 >= bundle_size and len(bundle_members) * 2 >= bundle_member_total:
+            return False
+        return True
+
+    def _extract_squashfs_bundle_members_via_mount(
+        self,
+        bundle_remote_path: str,
+        bundle_members: list[dict],
+    ) -> list[tuple[Path, Path, dict]]:
+        sqfscat = shutil.which("sqfscat")
+        bundle_path = self._get_bundle_mount_manager().bundle_local_path(bundle_remote_path)
+        if not sqfscat:
+            return self._extract_squashfs_bundle_members(bundle_path, bundle_members)
+
+        staged_members: list[tuple[Path, Path, dict]] = []
+        try:
+            for member in bundle_members:
+                anchor_rel = str(member["anchor_rel"])
+                local_path = Path(member["local_path"])
+                temp_local_path = self._create_download_temp_path(local_path)
+                with temp_local_path.open("wb") as handle:
+                    result = subprocess.run(
+                        [sqfscat, str(bundle_path), anchor_rel],
+                        check=False,
+                        stdout=handle,
+                        stderr=subprocess.PIPE,
+                    )
+                if result.returncode != 0:
+                    temp_local_path.unlink(missing_ok=True)
+                    detail = result.stderr.decode("utf-8", errors="replace").strip() or "sqfscat failed"
+                    raise RuntimeError(f"sqfscat failed for {bundle_remote_path}:{anchor_rel}: {detail}")
+
+                local_adler = adler32_local(temp_local_path)
+                expected_adler = str(member["adler32"])
+                if not self._adlers_match(local_adler, expected_adler):
+                    temp_local_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"bundle member checksum mismatch for {member['rel']}: "
+                        f"local={local_adler} expected={expected_adler}"
+                    )
+
+                staged_members.append((temp_local_path, local_path, member))
+        except Exception:
+            for temp_local_path, _local_path, _member in staged_members:
+                temp_local_path.unlink(missing_ok=True)
+            raise
+        return staged_members
+
+    def _extract_squashfs_bundle_members(self, bundle_path: Path, bundle_members: list[dict]) -> list[tuple[Path, Path, dict]]:
+        unsquashfs = shutil.which("unsquashfs")
+        if not unsquashfs:
+            raise RuntimeError("bundle format squashfs requires unsquashfs to be installed")
+
+        workspace_root = Path(dcache_mkdtemp(prefix="dcache-unsquashfs-"))
+        extraction_root = workspace_root / "extract"
+        staged_members: list[tuple[Path, Path, dict]] = []
+        requested_paths = [str(member["anchor_rel"]) for member in bundle_members]
+        try:
+            result = subprocess.run(
+                [
+                    unsquashfs,
+                    "-no-progress",
+                    "-dest",
+                    str(extraction_root),
+                    str(bundle_path),
+                    *requested_paths,
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr.strip() or result.stdout.strip() or "unsquashfs failed")
+                raise RuntimeError(f"unsquashfs failed for {bundle_path.name}: {detail}")
+
+            for member in bundle_members:
+                anchor_rel = str(member["anchor_rel"])
+                extracted_path = extraction_root / anchor_rel
+                if not extracted_path.is_file():
+                    raise RuntimeError(f"bundle member missing from squashfs archive: {anchor_rel}")
+
+                local_path = Path(member["local_path"])
+                temp_local_path = self._create_download_temp_path(local_path)
+                shutil.copyfile(extracted_path, temp_local_path)
+
+                local_adler = adler32_local(temp_local_path)
+                expected_adler = str(member["adler32"])
+                if not self._adlers_match(local_adler, expected_adler):
+                    raise RuntimeError(
+                        f"bundle member checksum mismatch for {member['rel']}: "
+                        f"local={local_adler} expected={expected_adler}"
+                    )
+
+                staged_members.append((temp_local_path, local_path, member))
+        except Exception:
+            for temp_local_path, _local_path, _member in staged_members:
+                temp_local_path.unlink(missing_ok=True)
+            raise
+        finally:
+            shutil.rmtree(workspace_root, ignore_errors=True)
+        return staged_members
+
+    def download_bundle(self, entry: dict) -> dict:
+        bundle_remote_path = str(entry["remote_path"]).strip("/")
+        bundle_members = _bundle_members_for_entry(entry)
+        if not bundle_members:
+            raise ValueError(f"bundle download entry has no members: {bundle_remote_path}")
+        bundle_format = str(entry.get("bundle_format", DEFAULT_BUNDLE_FORMAT))
+
+        if self.skip_verified and _bundle_entry_fully_verified(entry):
+            LOG.debug("skip bundle %s (all requested members already verified)", bundle_remote_path)
+            return {
+                "rel": entry["rel"],
+                "remote_path": bundle_remote_path,
+                "attempt": 0,
+                "skipped": True,
+                "bundle_members": bundle_members,
+            }
+
+        if self._should_try_sparse_bundle_read(entry, bundle_members, bundle_format):
+            try:
+                staged_members = self._extract_squashfs_bundle_members_via_mount(bundle_remote_path, bundle_members)
+                for temp_local_path, local_path, member in staged_members:
+                    self._install_verified_download(temp_local_path, local_path)
+                    try:
+                        os.chmod(local_path, int(member["mode"]))
+                    except OSError:
+                        LOG.debug("could not restore mode for %s", local_path)
+                return {
+                    "rel": entry["rel"],
+                    "remote_path": bundle_remote_path,
+                    "attempt": 1,
+                    "skipped": False,
+                    "bundle_members": bundle_members,
+                    "sparse": True,
+                }
+            except Exception as exc:
+                LOG.info("bundle sparse read fallback for %s: %s", bundle_remote_path, exc)
+
+        bundle_name = posixpath.basename(bundle_remote_path) or "bundle"
+        last_local_adler = ""
+        last_remote_adler = ""
+
+        for attempt in range(self.max_retries + 1):
+            temp_bundle_path = self._create_bundle_temp_path(bundle_name)
+            staged_members: list[tuple[Path, Path, dict]] = []
+            try:
+                self._rclone_copyto(f"{self.remote}:{bundle_remote_path}", str(temp_bundle_path))
+                last_local_adler, last_remote_adler = self._read_verified_adlers(
+                    temp_bundle_path,
+                    bundle_remote_path,
+                    display_name=bundle_name,
+                )
+                if not self._adlers_match(last_local_adler, last_remote_adler):
+                    raise RuntimeError(
+                        f"bundle checksum mismatch: local={last_local_adler} remote={last_remote_adler}"
+                    )
+
+                staged_members = self._extract_bundle_members(
+                    temp_bundle_path,
+                    bundle_members,
+                    bundle_format=bundle_format,
+                )
+                for temp_local_path, local_path, member in staged_members:
+                    self._install_verified_download(temp_local_path, local_path)
+                    try:
+                        os.chmod(local_path, int(member["mode"]))
+                    except OSError:
+                        LOG.debug("could not restore mode for %s", local_path)
+            except Exception as exc:
+                LOG.warning(
+                    "bundle download failed %s: %s (attempt %d/%d)",
+                    bundle_remote_path,
+                    exc,
+                    attempt + 1,
+                    self.max_retries + 1,
+                )
+                temp_bundle_path.unlink(missing_ok=True)
+                for temp_local_path, _local_path, _member in staged_members:
+                    temp_local_path.unlink(missing_ok=True)
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_wait)
+                    continue
+                raise RuntimeError(f"bundle download failed for {bundle_remote_path}: {exc}") from exc
+
+            temp_bundle_path.unlink(missing_ok=True)
+            return {
+                "rel": entry["rel"],
+                "remote_path": bundle_remote_path,
+                "attempt": attempt + 1,
+                "skipped": False,
+                "bundle_members": bundle_members,
+                "local_adler": last_local_adler,
+                "remote_adler": last_remote_adler,
+            }
+
+        raise RuntimeError(f"bundle download failed for {bundle_remote_path}")
 
     # -- shared helpers ----------------------------------------------------
 
@@ -2121,10 +3356,7 @@ class Transferer:
           backoff grows to 5 min then stays there
         Any other non-zero exit raises immediately.
         """
-        cmd = [self.ada_cmd, "--tokenfile", str(self.rclone_config)]
-        if self.api:
-            cmd += ["--api", self.api]
-        cmd += ["--checksum", "/" + remote_path.strip("/")]
+        cmd = _ada_tokenfile_cmd(self.ada_cmd, self.rclone_config, self.api) + ["--checksum", "/" + remote_path.strip("/")]
 
         deadline = time.monotonic() + self.checksum_timeout
         attempt = 0
@@ -2140,6 +3372,17 @@ class Transferer:
                     wait = min(2 ** attempt * 2, 60)  # 2 s … 60 s
                     if time.monotonic() + wait < deadline:
                         LOG.debug("ada rate-limited (429) for %s, retrying in %ds", remote_path, wait)
+                        time.sleep(wait)
+                        attempt += 1
+                        continue
+                if _ada_reports_transient_transport_error(output):
+                    wait = min(2 ** attempt * 2, 30)  # 2 s … 30 s
+                    if time.monotonic() + wait < deadline:
+                        LOG.warning(
+                            "ada transport failure for %s, retrying in %ds",
+                            remote_path,
+                            wait,
+                        )
                         time.sleep(wait)
                         attempt += 1
                         continue
@@ -2207,6 +3450,8 @@ def _execute_simple(
     workers: int,
     progress: Progress,
     bar: ProgressBar,
+    *,
+    result_handler=None,
 ):
     """Simple parallel execution — used for uploads and --no-stage downloads."""
     pool = _DaemonWorkerPool(worker_fn, workers, name_prefix="transfer-worker")
@@ -2227,7 +3472,7 @@ def _execute_simple(
             except queue.Empty:
                 continue
             remaining -= 1
-            _handle_worker_result(entry, exc, result, progress, bar)
+            _handle_worker_result(entry, exc, result, progress, bar, result_handler=result_handler)
     except KeyboardInterrupt:
         pool.stop()
         raise
@@ -2235,10 +3480,390 @@ def _execute_simple(
         pool.join(timeout=1)
 
 
+def _expected_bundle_member_map(job) -> dict[str, BundleMemberMetadata]:
+    return {
+        member.anchor_rel: BundleMemberMetadata(
+            anchor_rel=member.anchor_rel,
+            adler32=member.adler32,
+            size=member.size,
+            mtime_ns=member.mtime_ns,
+            mode=member.mode,
+        )
+        for member in job.members
+    }
+
+
+def _remote_bundle_xattrs(xattr_client: NamespaceXattrClient, remote_path: str) -> dict[str, str] | None:
+    try:
+        return xattr_client.list_xattrs(remote_path)
+    except NamespaceXattrError as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def _bundle_job_can_reuse_remote(job, xattr_client: NamespaceXattrClient) -> bool:
+    xattrs = _remote_bundle_xattrs(xattr_client, job.remote_path)
+    if xattrs is None:
+        return False
+
+    remote_bundle_id = xattrs.get("dcache_cp.bundle.id")
+    if remote_bundle_id and remote_bundle_id != job.bundle_id:
+        raise RuntimeError(
+            f"existing bundle object {job.remote_path} has bundle id {remote_bundle_id}, expected {job.bundle_id}; refusing to overwrite"
+        )
+    remote_anchor_dir = xattrs.get("dcache_cp.bundle.anchor_dir")
+    if remote_anchor_dir and remote_anchor_dir != job.anchor_dir:
+        raise RuntimeError(
+            f"existing bundle object {job.remote_path} belongs to anchor {remote_anchor_dir}, expected {job.anchor_dir}; refusing to overwrite"
+        )
+    remote_format = xattrs.get("dcache_cp.bundle.format")
+    if remote_format and remote_format != job.bundle_object_xattrs["dcache_cp.bundle.format"]:
+        raise RuntimeError(
+            f"existing bundle object {job.remote_path} has format {remote_format}, expected {job.bundle_object_xattrs['dcache_cp.bundle.format']}; refusing to overwrite"
+        )
+
+    remote_members = decode_bundle_members(xattrs)
+    expected_members = _expected_bundle_member_map(job)
+    if set(remote_members) != set(expected_members):
+        raise RuntimeError(
+            f"existing bundle object {job.remote_path} contains different members than expected; refusing to overwrite"
+        )
+    for anchor_rel, expected_member in expected_members.items():
+        remote_member = remote_members.get(anchor_rel)
+        if remote_member is None or not _bundle_member_matches_remote(
+            BundleMember(
+                rel=anchor_rel,
+                anchor_rel=expected_member.anchor_rel,
+                source=Path(anchor_rel),
+                resolved_source=Path(anchor_rel),
+                remote_path=job.remote_path,
+                size=expected_member.size,
+                mtime_ns=expected_member.mtime_ns,
+                mode=expected_member.mode,
+                adler32=expected_member.adler32,
+            ),
+            remote_member,
+        ):
+            raise RuntimeError(
+                f"existing bundle object {job.remote_path} has different metadata for member {anchor_rel}; refusing to overwrite"
+            )
+    return True
+
+
+def _publish_anchor_route_generation(xattr_client: NamespaceXattrClient, anchor_plan: AnchorBundlePlan) -> None:
+    anchor_xattrs = build_anchor_xattrs(anchor_plan)
+    active_generation = anchor_xattrs.pop("dcache_cp.bundle_anchor.active_generation")
+    if anchor_xattrs:
+        xattr_client.set_xattrs(anchor_plan.anchor_dir, anchor_xattrs)
+    xattr_client.set_xattrs(
+        anchor_plan.anchor_dir,
+        {"dcache_cp.bundle_anchor.active_generation": active_generation},
+    )
+
+
+def _publish_anchor_route_map(
+    xattr_client: NamespaceXattrClient,
+    anchor_dir: str,
+    route_map: dict[str, str],
+    generation: str,
+) -> None:
+    anchor_xattrs = build_anchor_xattrs_for_routes(route_map, generation)
+    active_generation = anchor_xattrs.pop("dcache_cp.bundle_anchor.active_generation")
+    if anchor_xattrs:
+        xattr_client.set_xattrs(anchor_dir, anchor_xattrs)
+    xattr_client.set_xattrs(
+        anchor_dir,
+        {"dcache_cp.bundle_anchor.active_generation": active_generation},
+    )
+
+
+def _apply_bundle_deprecations(xattr_client: NamespaceXattrClient, anchor_plan: AnchorBundlePlan) -> None:
+    for deprecation_plan in anchor_plan.deprecations:
+        existing_xattrs = xattr_client.list_xattrs(deprecation_plan.remote_path)
+        merged = decode_bundle_deprecated(existing_xattrs)
+        for record in deprecation_plan.members:
+            merged[record.anchor_rel] = record
+        xattr_client.set_xattrs(
+            deprecation_plan.remote_path,
+            build_bundle_deprecated_xattrs(merged),
+        )
+
+
+def _delete_bundle_sources(members: tuple[BundleMember, ...] | list[BundleMember]) -> None:
+    for member in members:
+        Path(member.source).unlink(missing_ok=True)
+
+
+def _bundle_is_fully_retired(
+    bundle_members: dict[str, BundleMemberMetadata],
+    route_map: dict[str, str],
+    bundle_id: str,
+    deleted: dict[str, BundleDeletedRecord],
+    deprecated: dict[str, BundleDeprecationRecord],
+) -> bool:
+    if any(current_bundle_id == bundle_id for current_bundle_id in route_map.values()):
+        return False
+    retired_members = set(deleted) | set(deprecated)
+    return set(bundle_members).issubset(retired_members)
+
+
+def _bundle_route_cleanup_targets(
+    bundle_id: str,
+    route_map: dict[str, str],
+    deleted: dict[str, BundleDeletedRecord],
+    deprecated: dict[str, BundleDeprecationRecord],
+) -> set[str]:
+    retired_members = set(deleted) | set(deprecated)
+    return {
+        anchor_rel
+        for anchor_rel in retired_members
+        if route_map.get(anchor_rel) == bundle_id
+    }
+
+
+def _commit_bundle_download_move(
+    entry: dict,
+    result: dict,
+    xattr_client: NamespaceXattrClient,
+    transferer: Transferer,
+) -> None:
+    bundle_members = result.get("bundle_members")
+    if not isinstance(bundle_members, list) or not bundle_members:
+        raise RuntimeError("bundle move commit requires resolved bundle members")
+
+    bundle_remote_path = str(result.get("remote_path", entry["remote_path"])).strip("/")
+    anchor_dir = str(entry.get("bundle_anchor_dir", "")).strip("/")
+    bundle_id = str(entry.get("bundle_id", "")).strip()
+    if not anchor_dir or not bundle_id:
+        raise RuntimeError(f"bundle move commit missing anchor metadata for {bundle_remote_path}")
+
+    deleted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    requested_anchor_rels = [str(member["anchor_rel"]) for member in bundle_members]
+    latest_bundle_member_map: dict[str, BundleMemberMetadata] = {}
+    latest_deleted: dict[str, BundleDeletedRecord] = {}
+    latest_deprecated: dict[str, BundleDeprecationRecord] = {}
+    latest_route_map: dict[str, str] = {}
+
+    for attempt in range(8):
+        commit_generation = make_bundle_generation()
+
+        bundle_xattrs = xattr_client.list_xattrs(bundle_remote_path)
+        remote_bundle_id = str(bundle_xattrs.get("dcache_cp.bundle.id") or "").strip()
+        if remote_bundle_id and remote_bundle_id != bundle_id:
+            raise RuntimeError(
+                f"bundle move commit refused: bundle object {bundle_remote_path} advertises bundle id {remote_bundle_id}, expected {bundle_id}"
+            )
+        remote_anchor_dir = str(bundle_xattrs.get("dcache_cp.bundle.anchor_dir") or "").strip("/")
+        if remote_anchor_dir and remote_anchor_dir != anchor_dir:
+            raise RuntimeError(
+                f"bundle move commit refused: bundle object {bundle_remote_path} belongs to anchor {remote_anchor_dir or '/'}; expected {anchor_dir or '/'}"
+            )
+
+        latest_bundle_member_map = decode_bundle_members(bundle_xattrs)
+        latest_deleted = decode_bundle_deleted(bundle_xattrs)
+        latest_deprecated = decode_bundle_deprecated(bundle_xattrs)
+
+        anchor_xattrs = xattr_client.list_xattrs(anchor_dir)
+        route_map = decode_anchor_routes(anchor_xattrs)
+
+        for anchor_rel in requested_anchor_rels:
+            if anchor_rel not in latest_bundle_member_map:
+                raise RuntimeError(
+                    f"bundle move commit refused: {bundle_remote_path} has no member {anchor_rel!r}"
+                )
+            current_bundle_id = route_map.get(anchor_rel)
+            if current_bundle_id != bundle_id:
+                raise RuntimeError(
+                    f"bundle move commit refused: active route for {anchor_dir or '/'}:{anchor_rel} points to {current_bundle_id or '<missing>'}, expected {bundle_id}"
+                )
+            latest_deleted[anchor_rel] = BundleDeletedRecord(
+                anchor_rel=anchor_rel,
+                deleted_generation=commit_generation,
+                deleted_at=deleted_at,
+            )
+
+        xattr_client.set_xattrs(bundle_remote_path, build_bundle_deleted_xattrs(latest_deleted))
+
+        current_bundle_xattrs = xattr_client.list_xattrs(bundle_remote_path)
+        latest_bundle_member_map = decode_bundle_members(current_bundle_xattrs)
+        latest_deleted = decode_bundle_deleted(current_bundle_xattrs)
+        latest_deprecated = decode_bundle_deprecated(current_bundle_xattrs)
+
+        if any(anchor_rel not in latest_deleted for anchor_rel in requested_anchor_rels):
+            continue
+
+        current_anchor_xattrs = xattr_client.list_xattrs(anchor_dir)
+        route_map = decode_anchor_routes(current_anchor_xattrs)
+        cleanup_targets = _bundle_route_cleanup_targets(bundle_id, route_map, latest_deleted, latest_deprecated)
+        if cleanup_targets:
+            for anchor_rel in cleanup_targets:
+                route_map.pop(anchor_rel, None)
+            _publish_anchor_route_map(xattr_client, anchor_dir, route_map, commit_generation)
+
+        current_anchor_xattrs = xattr_client.list_xattrs(anchor_dir)
+        latest_route_map = decode_anchor_routes(current_anchor_xattrs)
+        stale_targets = _bundle_route_cleanup_targets(bundle_id, latest_route_map, latest_deleted, latest_deprecated)
+        if not stale_targets:
+            break
+    else:
+        raise RuntimeError(
+            f"bundle move commit refused: could not publish a stable route update for {bundle_remote_path} after repeated retries"
+        )
+
+    if _bundle_is_fully_retired(
+        latest_bundle_member_map,
+        latest_route_map,
+        bundle_id,
+        latest_deleted,
+        latest_deprecated,
+    ):
+        try:
+            transferer._rclone_deletefile(f"{transferer.remote}:{bundle_remote_path}")
+        except Exception as exc:
+            LOG.warning("bundle cleanup after move failed for %s: %s", bundle_remote_path, exc)
+        else:
+            LOG.info("removed fully deleted bundle object %s", bundle_remote_path)
+
+
+def _execute_bundle_uploads(
+    bundle_plan: BundleUploadPlan,
+    transferer: Transferer,
+    xattr_client: NamespaceXattrClient,
+    progress: Progress,
+    bar: ProgressBar,
+    *,
+    delete_source: bool,
+    keep_temp: bool,
+):
+    """Upload prepared bundle objects and commit their anchor xattrs per directory."""
+    for anchor_plan in bundle_plan.anchors:
+        materialized_entries: list[dict] = []
+        uploaded_jobs: list[dict[str, object]] = []
+        try:
+            for job in anchor_plan.bundles:
+                if _bundle_job_can_reuse_remote(job, xattr_client):
+                    uploaded_jobs.append({
+                        "job": job,
+                        "result": {"attempt": 0, "remote_path": job.remote_path, "skipped": True},
+                        "reused": True,
+                        "uploaded": False,
+                        "xattrs_published": True,
+                    })
+                    continue
+
+                entry = materialize_bundle_job(job, keep_temp=keep_temp)
+                materialized_entries.append(entry)
+                result = transferer.upload(entry)
+                uploaded_jobs.append({
+                    "job": job,
+                    "result": result,
+                    "reused": False,
+                    "uploaded": True,
+                    "xattrs_published": False,
+                })
+                xattr_client.set_xattrs(job.remote_path, job.bundle_object_xattrs)
+                uploaded_jobs[-1]["xattrs_published"] = True
+
+            if anchor_plan.commit_required:
+                _publish_anchor_route_generation(xattr_client, anchor_plan)
+            if anchor_plan.deprecations:
+                _apply_bundle_deprecations(xattr_client, anchor_plan)
+            if delete_source:
+                _delete_bundle_sources(anchor_plan.reused_members)
+                for state in uploaded_jobs:
+                    _delete_bundle_sources(state["job"].members)
+
+        except Exception as exc:
+            for state in uploaded_jobs:
+                if not state.get("uploaded") or state.get("xattrs_published"):
+                    continue
+                job = state["job"]
+                try:
+                    transferer._rclone_deletefile(f"{transferer.remote}:{job.remote_path}")
+                except Exception as cleanup_exc:
+                    LOG.warning("bundle cleanup failed for %s: %s", job.remote_path, cleanup_exc)
+                else:
+                    LOG.warning("removed incomplete bundle object %s after upload/xattr failure", job.remote_path)
+            for member in anchor_plan.reused_members:
+                progress.failure(member.rel, member.size, exc)
+            for job in anchor_plan.bundles:
+                for member in job.members:
+                    progress.failure(member.rel, member.size, exc)
+            bar.finish()
+            LOG.error("%s\u2718%s bundle anchor %s: %s", _C.RED, _C.RESET, anchor_plan.anchor_dir or "/", exc)
+            bar.update(anchor_plan.anchor_dir or "/")
+        else:
+            if anchor_plan.reused_members:
+                for member in anchor_plan.reused_members:
+                    progress.success(member.rel, member.size, attempts=0, skipped=True)
+                bar.finish()
+                LOG.info(
+                    "%s\u2714%s reused %s%d%s bundle-backed file(s) for %s",
+                    _C.CYAN,
+                    _C.RESET,
+                    _C.CYAN,
+                    len(anchor_plan.reused_members),
+                    _C.RESET,
+                    anchor_plan.anchor_dir or "/",
+                )
+                bar.update(anchor_plan.anchor_dir or "/")
+
+            for state in uploaded_jobs:
+                job = state["job"]
+                result = state["result"]
+                attempts = int(result.get("attempt", 1))
+                skipped = bool(result.get("skipped", False) or state.get("reused"))
+                for index, member in enumerate(job.members):
+                    progress.success(member.rel, member.size, attempts=attempts if index == 0 else 1, skipped=skipped)
+                bar.finish()
+                if skipped:
+                    LOG.info(
+                        "%s\u2714%s reused bundle %s %s(%d files, %s)%s",
+                        _C.CYAN,
+                        _C.RESET,
+                        job.remote_path,
+                        _C.DIM,
+                        len(job.members),
+                        format_bytes(job.logical_total_bytes),
+                        _C.RESET,
+                    )
+                else:
+                    LOG.info(
+                        "%s\u2714%s bundle %s %s(%d files, %s)%s",
+                        _C.GREEN,
+                        _C.RESET,
+                        job.remote_path,
+                        _C.DIM,
+                        len(job.members),
+                        format_bytes(job.logical_total_bytes),
+                        _C.RESET,
+                    )
+                bar.update(job.remote_path)
+        finally:
+            if keep_temp:
+                continue
+            for entry in materialized_entries:
+                Path(entry["resolved_source"]).unlink(missing_ok=True)
+
+
 def _handle_failed_result(entry: dict, exc: BaseException, progress: Progress, bar: ProgressBar):
     stage_key = entry.get("remote_path")
     if isinstance(stage_key, str):
         stage_key = "/" + stage_key.strip("/")
+    bundle_members = _bundle_members_for_entry(entry)
+    if bundle_members:
+        for index, member in enumerate(bundle_members):
+            progress.failure(
+                member["rel"],
+                int(member.get("size", 0)),
+                exc,
+                stage_key=stage_key if index == 0 and isinstance(stage_key, str) else None,
+            )
+        bar.finish()
+        LOG.error("%s\u2718%s bundle %s: %s", _C.RED, _C.RESET, entry["remote_path"], exc)
+        bar.update(str(entry["remote_path"]))
+        return None
     progress.failure(entry["rel"], entry.get("size", 0), exc, stage_key=stage_key if isinstance(stage_key, str) else None)
     bar.finish()
     LOG.error("%s\u2718%s %s: %s", _C.RED, _C.RESET, entry["rel"], exc)
@@ -2251,6 +3876,34 @@ def _handle_completed_result(result: dict, entry: dict, progress: Progress, bar:
     stage_key = entry.get("remote_path")
     if isinstance(stage_key, str):
         stage_key = "/" + stage_key.strip("/")
+    bundle_members = result.get("bundle_members")
+    if isinstance(bundle_members, list) and bundle_members:
+        attempts = int(result.get("attempt", 1))
+        logical_total = sum(int(member.get("size", 0)) for member in bundle_members)
+        for index, member in enumerate(bundle_members):
+            progress.success(
+                member["rel"],
+                int(member.get("size", 0)),
+                attempts=attempts if index == 0 else 1,
+                skipped=skipped,
+                stage_key=stage_key if index == 0 and isinstance(stage_key, str) else None,
+            )
+        if skipped:
+            LOG.debug("%s\u2714%s bundle %s %s(verified)%s", _C.CYAN, _C.RESET, result["remote_path"], _C.DIM, _C.RESET)
+        else:
+            bar.finish()
+            LOG.info(
+                "%s\u2714%s bundle %s %s(%d files, %s)%s",
+                _C.GREEN,
+                _C.RESET,
+                result["remote_path"],
+                _C.DIM,
+                len(bundle_members),
+                format_bytes(logical_total),
+                _C.RESET,
+            )
+        bar.update(str(result.get("remote_path", entry["rel"])))
+        return result
     progress.success(
         entry["rel"], entry.get("size", 0),
         attempts=result.get("attempt", 1),
@@ -2276,11 +3929,18 @@ def _handle_worker_result(
     result: dict | None,
     progress: Progress,
     bar: ProgressBar,
+    *,
+    result_handler=None,
 ):
     if exc is not None:
         return _handle_failed_result(entry, exc, progress, bar)
     if result is None:
         return _handle_failed_result(entry, RuntimeError("worker finished without a result"), progress, bar)
+    if result_handler is not None:
+        try:
+            result_handler(entry, result)
+        except BaseException as handler_exc:
+            return _handle_failed_result(entry, handler_exc, progress, bar)
     return _handle_completed_result(result, entry, progress, bar)
 
 
@@ -2293,6 +3953,15 @@ def _filter_verified_download_entries(
     skipped: list[dict] = []
 
     for entry in files:
+        bundle_members = _bundle_members_for_entry(entry)
+        if bundle_members:
+            if transferer.skip_verified and _bundle_entry_fully_verified(entry):
+                LOG.debug("skip bundle %s (verified before staging)", entry["remote_path"])
+                skipped.append(entry)
+                continue
+            remaining.append(entry)
+            continue
+
         local_path = Path(entry["local_path"])
         if not transferer.skip_verified or not local_path.exists():
             remaining.append(entry)
@@ -2315,6 +3984,16 @@ def _filter_verified_download_entries(
     return remaining, skipped
 
 
+def _apply_pre_skipped_entries(progress: Progress, entries: list[dict]) -> None:
+    for entry in entries:
+        bundle_members = _bundle_members_for_entry(entry)
+        if bundle_members:
+            for member in bundle_members:
+                progress.success(member["rel"], int(member.get("size", 0)), attempts=0, skipped=True)
+            continue
+        progress.success(entry["rel"], int(entry.get("size", 0)), attempts=0, skipped=True)
+
+
 def _build_stage_batches(files: list[dict], max_files: int, max_bytes: int) -> list[list[dict]]:
     """Split download entries into batches bounded by file count and staged bytes."""
     batches: list[list[dict]] = []
@@ -2322,7 +4001,7 @@ def _build_stage_batches(files: list[dict], max_files: int, max_bytes: int) -> l
     current_bytes = 0
 
     for entry in files:
-        entry_size = max(int(entry.get("size", 0)), 0)
+        entry_size = _entry_stage_bytes(entry)
         if current and (len(current) >= max_files or current_bytes + entry_size > max_bytes):
             batches.append(current)
             current = []
@@ -2376,6 +4055,93 @@ def _destage_paths(
     return failures
 
 
+class _BundleMountManager:
+    def __init__(self, rclone_config: Path, remote: str):
+        self.rclone_config = Path(rclone_config).expanduser()
+        self.remote = remote
+        self._mountpoint: Path | None = None
+        self._lock = threading.Lock()
+        self._cleanup_registered = False
+
+    @staticmethod
+    def _find_unmount_cmd() -> list[str] | None:
+        for command in ("fusermount3", "fusermount", "umount"):
+            executable = shutil.which(command)
+            if not executable:
+                continue
+            if command.startswith("fuser"):
+                return [executable, "-u"]
+            return [executable]
+        return None
+
+    @classmethod
+    def available(cls) -> bool:
+        return bool(shutil.which("rclone") and shutil.which("unsquashfs") and cls._find_unmount_cmd())
+
+    def ensure_mounted(self) -> Path:
+        with self._lock:
+            if self._mountpoint is not None:
+                return self._mountpoint
+            if not self.available():
+                raise RuntimeError("sparse bundle reads require rclone mount, unsquashfs, and a FUSE unmount helper")
+
+            mountpoint = Path(dcache_mkdtemp(prefix=f"dcache-rclone-mount-{self.remote}-"))
+            result = run_command(
+                [
+                    "rclone",
+                    "--config",
+                    str(self.rclone_config),
+                    "mount",
+                    "--daemon",
+                    "--read-only",
+                    "--dir-cache-time",
+                    "1m",
+                    "--poll-interval",
+                    "0",
+                    "--vfs-cache-mode",
+                    "off",
+                    "--attr-timeout",
+                    "1s",
+                    f"{self.remote}:",
+                    str(mountpoint),
+                ],
+                check=False,
+            )
+            if result.returncode != 0:
+                shutil.rmtree(mountpoint, ignore_errors=True)
+                detail = (result.stderr.strip() or result.stdout.strip() or "rclone mount failed")
+                raise RuntimeError(f"sparse bundle mount failed for {self.remote}: {detail}")
+
+            self._mountpoint = mountpoint
+            if not self._cleanup_registered:
+                atexit.register(self.close)
+                self._cleanup_registered = True
+            return mountpoint
+
+    def bundle_local_path(self, remote_path: str) -> Path:
+        mountpoint = self.ensure_mounted()
+        clean_remote_path = str(remote_path).strip("/")
+        return mountpoint / clean_remote_path
+
+    def close(self) -> None:
+        with self._lock:
+            mountpoint = self._mountpoint
+            self._mountpoint = None
+        if mountpoint is None:
+            return
+
+        unmount_cmd = self._find_unmount_cmd()
+        try:
+            if unmount_cmd is not None:
+                result = run_command([*unmount_cmd, str(mountpoint)], check=False)
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip() or "unmount failed"
+                    LOG.warning("bundle mount cleanup failed for %s: %s", mountpoint, detail)
+            shutil.rmtree(mountpoint, ignore_errors=True)
+        except Exception as exc:
+            LOG.warning("bundle mount cleanup failed for %s: %s", mountpoint, exc)
+
+
 def _execute_pipeline_download(
     files: list[dict],
     transferer: Transferer,
@@ -2389,6 +4155,8 @@ def _execute_pipeline_download(
     stage_poll: int,
     stage_timeout: int,
     destage: bool,
+    worker_fn=None,
+    result_handler=None,
 ):
     """Pipeline: stage a batch → download as files come online → destage completed files.
 
@@ -2427,7 +4195,7 @@ def _execute_pipeline_download(
         pending_downloads = 0
         stage_error_messages: dict[str, str] = {}
         deferred_destage_paths: list[str] = []
-        pool = _DaemonWorkerPool(transferer.download, workers, name_prefix="stage-download-worker")
+        pool = _DaemonWorkerPool(worker_fn or transferer.download, workers, name_prefix="stage-download-worker")
         fallback_pool: _DaemonWorkerPool | None = None
         if fallback_enabled:
             fallback_pool = _DaemonWorkerPool(
@@ -2578,7 +4346,7 @@ def _execute_pipeline_download(
                         break
                     pending_downloads -= 1
                     done_results += 1
-                    handled = _handle_worker_result(entry, exc, result, progress, bar)
+                    handled = _handle_worker_result(entry, exc, result, progress, bar, result_handler=result_handler)
                     if handled is not None:
                         batch_completed_bytes += int(entry.get("size", 0))
                         batch_completed_files += 1
@@ -2627,7 +4395,7 @@ def _execute_pipeline_download(
                         pass
                     else:
                         pending_downloads -= 1
-                        handled = _handle_worker_result(entry, exc, result, progress, bar)
+                        handled = _handle_worker_result(entry, exc, result, progress, bar, result_handler=result_handler)
                         if handled is not None:
                             batch_completed_bytes += int(entry.get("size", 0))
                             batch_completed_files += 1
@@ -2690,6 +4458,14 @@ def build_parser(*, prog: str = "dcache_cp", delete_source: bool = False) -> arg
                          "(prefix with <remote>: for dCache). Multiple sources are supported.")
     p.add_argument("--file-list", type=Path, metavar="TSV",
                     help="Two-column TSV file with source/destination pairs (one per line)")
+    p.add_argument(
+        "--literal-file-list",
+        action="store_true",
+        help=(
+            "Treat download file-list sources as exact physical paths; skip "
+            "parent-directory enumeration and bundle resolution"
+        ),
+    )
     p.add_argument("-R", "--recursive", action="store_true", help="Copy directories recursively")
     p.add_argument(
         "--config", "--rclone-config", dest="config", type=Path,
@@ -2712,6 +4488,29 @@ def build_parser(*, prog: str = "dcache_cp", delete_source: bool = False) -> arg
                     metavar="SEC",
                     help="Max seconds to wait for dCache to compute a checksum "
                          "(default: 14400 = 4h; TB-class files can take hours)")
+    p.add_argument("--bundle-small-files", action="store_true",
+                    help="Bundle eligible upload directories into SquashFS archives before upload with append-only remote reuse")
+    p.add_argument("--bundle-format", default=DEFAULT_BUNDLE_FORMAT,
+                    choices=[DEFAULT_BUNDLE_FORMAT],
+                    help="Bundle archive format (currently only squashfs is supported)")
+    p.add_argument("--bundle-target-size", type=parse_size_literal, default=DEFAULT_BUNDLE_TARGET_SIZE,
+                    metavar="SIZE",
+                    help="Target uncompressed bytes per bundle (default: 1GiB)")
+    p.add_argument("--bundle-max-file-size", type=parse_size_literal, default=DEFAULT_BUNDLE_MAX_FILE_SIZE,
+                    metavar="SIZE",
+                    help="Maximum file size eligible for bundling (default: 64MiB)")
+    p.add_argument("--bundle-min-dir-total", type=parse_size_literal, default=DEFAULT_BUNDLE_MIN_DIR_TOTAL,
+                    metavar="SIZE",
+                    help="Minimum total bytes in a directory before bundling activates (default: 256MiB)")
+    p.add_argument("--bundle-max-members", type=int, default=DEFAULT_BUNDLE_MAX_MEMBERS,
+                    metavar="N",
+                    help="Maximum members per bundle (default: 10000)")
+    p.add_argument("--bundle-keep-temp", action="store_true",
+                    help="Keep temporary local bundle archives after upload for debugging")
+    p.add_argument("--no-unpack-bundles", action="store_true",
+                    help="Download raw .dcpbundle objects instead of transparently unpacking bundled content")
+    p.add_argument("--ignore-bundle-xattrs", action="store_true",
+                    help="Ignore bundle xattrs and treat remote layout as plain physical files")
     # Staging options (download only)
     p.add_argument("--no-stage", action="store_true",
                     help="Skip staging; assume files are already online (download only)")
@@ -2743,6 +4542,9 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
 
     # ---- Determine source/dest and direction ----
     if args.file_list:
+        if args.bundle_small_files:
+            LOG.error("--bundle-small-files is not supported together with --file-list")
+            return 1
         if args.paths:
             LOG.error("do not specify paths when using --file-list")
             return 1
@@ -2815,32 +4617,116 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
             # Actual enumeration happens below after config is resolved.
             pass
 
+    if args.bundle_small_files:
+        if direction != "upload":
+            LOG.error("--bundle-small-files is only supported for uploads")
+            return 1
+        if args.file_list:
+            LOG.error("--bundle-small-files is not supported together with --file-list yet")
+            return 1
+        if not args.recursive:
+            LOG.error("--bundle-small-files requires -R/--recursive")
+            return 1
+        for src_raw in sources_raw:
+            bundle_source = Path(parse_remote_prefix(src_raw)[1]).expanduser()
+            if not bundle_source.is_dir():
+                LOG.error("--bundle-small-files requires directory sources, but %s is not a directory", bundle_source)
+                return 1
+
     # ---- Resolve config ----
     rclone_config = resolve_config_for_prefix(prefix, args.config)
     config = load_rclone_config(rclone_config)
     remote = resolve_remote_name(config, args.remote)
     api = resolve_api_url(args.api, config[remote])
+    if args.literal_file_list:
+        if not args.file_list or direction != "download":
+            LOG.error("--literal-file-list requires a download --file-list")
+            return 1
+        if delete_source:
+            LOG.error("--literal-file-list is not supported for download moves")
+            return 1
+    download_bundle_enabled = (
+        direction == "download"
+        and not args.literal_file_list
+        and not args.no_unpack_bundles
+        and not args.ignore_bundle_xattrs
+    )
+    download_bundle_entries: list[dict] = []
+    download_bundle_resolver: _BundleDownloadResolver | None = None
+    bundle_upload_resolver: _BundleUploadResolver | None = None
+
+    def _get_download_bundle_resolver() -> _BundleDownloadResolver:
+        nonlocal download_bundle_resolver
+        if download_bundle_resolver is None:
+            download_bundle_resolver = _BundleDownloadResolver(rclone_config, remote, api, config[remote])
+        return download_bundle_resolver
 
     if args.file_list and delete_source and direction == "upload":
         files = _filter_resumed_move_upload_file_list_entries(rclone_config, remote, files)
 
     if args.file_list and direction == "download":
-        files = _fill_file_list_download_sizes(
-            rclone_config,
-            remote,
-            files,
-            allow_resumed_move=delete_source,
-        )
+        try:
+            if args.literal_file_list:
+                # The caller guarantees these are exact physical paths.
+                # Keep their unknown size at zero for progress accounting;
+                # rclone reports missing paths and Adler-32 verification still
+                # gates atomic installation of every downloaded file.
+                pass
+            elif download_bundle_enabled:
+                files, download_bundle_entries = _plan_file_list_downloads_with_bundles(
+                    rclone_config,
+                    remote,
+                    files,
+                    _get_download_bundle_resolver(),
+                    allow_resumed_move=delete_source,
+                )
+            else:
+                files = _fill_file_list_download_sizes(
+                    rclone_config,
+                    remote,
+                    files,
+                    allow_resumed_move=delete_source,
+                )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            LOG.error("%s", exc)
+            return 1
 
     # ---- Plan downloads if not from file-list ----
     if not args.file_list and direction == "download":
-        files = []
+        plain_download_entries: list[dict] = []
+        pending_bundle_entries: list[dict] = []
         with _EnumSpinner("listing remote") as spinner:
             for src_raw in sources_raw:
                 _, src_path = parse_remote_prefix(src_raw)
-                files.extend(plan_download(rclone_config, remote, src_path,
-                                           Path(dst_path_dir), args.recursive,
-                                           spinner=spinner))
+                try:
+                    if download_bundle_enabled:
+                        plain_part, bundle_part = _plan_download_source_with_bundles(
+                            rclone_config,
+                            remote,
+                            src_path,
+                            Path(dst_path_dir),
+                            args.recursive,
+                            _get_download_bundle_resolver(),
+                            spinner=spinner,
+                        )
+                        plain_download_entries.extend(plain_part)
+                        pending_bundle_entries.extend(bundle_part)
+                    else:
+                        plain_download_entries.extend(
+                            plan_download(
+                                rclone_config,
+                                remote,
+                                src_path,
+                                Path(dst_path_dir),
+                                args.recursive,
+                                spinner=spinner,
+                            )
+                        )
+                except (FileNotFoundError, RuntimeError, ValueError) as exc:
+                    LOG.error("%s", exc)
+                    return 1
+        files = plain_download_entries
+        download_bundle_entries = _merge_bundle_download_entries(pending_bundle_entries)
 
     # ---- Validate ----
     if args.workers < 1:
@@ -2852,13 +4738,31 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
     if args.stage_batch_bytes < 1:
         LOG.error("--stage-batch-bytes must be >= 1"); return 1
 
-    if not files:
+    if not files and not download_bundle_entries:
         LOG.info("no files to process")
         return 0
 
-    planned_files = files
-    planned_total_files = len(planned_files)
-    planned_total_bytes = sum(e.get("size", 0) for e in planned_files)
+    planned_entries = [*files, *download_bundle_entries]
+    planned_total_files = sum(_entry_logical_file_count(entry) for entry in planned_entries)
+    planned_total_bytes = sum(_entry_logical_bytes(entry) for entry in planned_entries)
+
+    bundle_plan: BundleUploadPlan | None = None
+    if direction == "upload" and args.bundle_small_files:
+        bundle_options = BundleOptions(
+            format=args.bundle_format,
+            target_size=args.bundle_target_size,
+            max_file_size=args.bundle_max_file_size,
+            min_dir_total=args.bundle_min_dir_total,
+            max_members=args.bundle_max_members,
+            keep_temp=args.bundle_keep_temp,
+        )
+        try:
+            bundle_upload_resolver = _BundleUploadResolver(rclone_config, remote, api, config[remote])
+            bundle_plan = _build_incremental_bundle_upload_plan(files, bundle_options, bundle_upload_resolver)
+        except (NamespaceXattrError, RuntimeError, ValueError) as exc:
+            LOG.error("%s", exc)
+            return 1
+        files = list(bundle_plan.plain_entries)
 
     # ---- Transferer ----
     transferer = Transferer(
@@ -2869,21 +4773,88 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
     )
 
     pre_skipped_entries: list[dict] = []
-    if direction == "download" and args.skip_verified:
+    if direction == "download" and args.skip_verified and not delete_source:
         LOG.info("resume  : checking for already verified local files before download")
-        files, pre_skipped_entries = _filter_verified_download_entries(files, transferer)
+        files, skipped_plain_entries = _filter_verified_download_entries(files, transferer)
+        pre_skipped_entries.extend(skipped_plain_entries)
+        if download_bundle_entries:
+            download_bundle_entries, skipped_bundle_entries = _filter_verified_download_entries(download_bundle_entries, transferer)
+            pre_skipped_entries.extend(skipped_bundle_entries)
 
     total_bytes = planned_total_bytes
-    remaining_bytes = sum(e.get("size", 0) for e in files)
+    remaining_bytes = sum(_entry_logical_bytes(entry) for entry in [*files, *download_bundle_entries])
 
     # ---- Dry run ----
     if args.dry_run:
-        LOG.info("dry run (%s): %d file(s), %s", direction, len(files), format_bytes(remaining_bytes))
+        LOG.info("dry run (%s): %d logical file(s), %s", direction, planned_total_files, format_bytes(planned_total_bytes))
+        plain_remaining_bytes = sum(_entry_logical_bytes(entry) for entry in files)
+        if bundle_plan and bundle_plan.bundled_file_count:
+            LOG.info(
+                "bundles : %d new bundle object(s) covering %d logical file(s), %s",
+                bundle_plan.bundle_count,
+                bundle_plan.bundled_file_count,
+                format_bytes(bundle_plan.bundled_total_bytes),
+            )
+            if bundle_plan.reused_file_count:
+                LOG.info(
+                    "resume  : %d bundled logical file(s) already present remotely and will be reused",
+                    bundle_plan.reused_file_count,
+                )
+            for anchor_plan in bundle_plan.anchors:
+                if anchor_plan.reused_members:
+                    LOG.info(
+                        "  reuse %s (%d files)",
+                        anchor_plan.anchor_dir or "/",
+                        len(anchor_plan.reused_members),
+                    )
+                for job in anchor_plan.bundles:
+                    LOG.info(
+                        "  bundle %s -> %s (%d files, %s)",
+                        job.bundle_id[:12],
+                        job.remote_path,
+                        job.logical_file_count,
+                        format_bytes(job.logical_total_bytes),
+                    )
+        elif download_bundle_entries:
+            bundled_file_count = sum(_entry_logical_file_count(entry) for entry in download_bundle_entries)
+            bundled_total_bytes = sum(_entry_logical_bytes(entry) for entry in download_bundle_entries)
+            LOG.info(
+                "bundles : %d bundle object(s) covering %d logical file(s), %s",
+                len(download_bundle_entries),
+                bundled_file_count,
+                format_bytes(bundled_total_bytes),
+            )
+            for entry in download_bundle_entries:
+                bundle_members = _bundle_members_for_entry(entry)
+                sparse_planned = Transferer._should_try_sparse_bundle_read(
+                    entry,
+                    bundle_members,
+                    str(entry.get("bundle_format", DEFAULT_BUNDLE_FORMAT)),
+                )
+                LOG.info(
+                    "  bundle %s -> %s (%d files, %s, %s)",
+                    str(entry["bundle_id"])[:12],
+                    entry["remote_path"],
+                    _entry_logical_file_count(entry),
+                    format_bytes(_entry_logical_bytes(entry)),
+                    "sparse member read" if sparse_planned else "full bundle read",
+                )
+        if files:
+            LOG.info("plain   : %d physical file(s), %s", len(files), format_bytes(plain_remaining_bytes))
         for e in files:
             if direction == "upload":
                 LOG.info("  %s -> %s (%s)", e["rel"], e["remote_path"], format_bytes(e.get("size", 0)))
             else:
                 LOG.info("  %s -> %s (%s)", e["remote_path"], e.get("local_path", "?"), format_bytes(e.get("size", 0)))
+        for entry in download_bundle_entries:
+            for member in _bundle_members_for_entry(entry):
+                LOG.info(
+                    "  %s -> %s (%s)%s",
+                    member["remote_path"],
+                    member["local_path"],
+                    format_bytes(int(member.get("size", 0))),
+                    f" via {entry['remote_path']}" if args.verbose else "",
+                )
         return 0
 
     # ---- Quota tracker ----
@@ -2909,50 +4880,184 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
              _C.DIM, _C.RESET, args.workers, args.max_retries, "yes" if args.skip_verified else "no")
     if delete_source:
         LOG.info("%ssource%s  : delete after verified transfer", _C.DIM, _C.RESET)
+    if bundle_plan is not None:
+        if bundle_plan.bundled_file_count:
+            LOG.info(
+                "%sbundles%s : %s%d%s new bundle object(s), covering %s%d%s logical files (%s)",
+                _C.DIM,
+                _C.RESET,
+                _C.CYAN,
+                bundle_plan.bundle_count,
+                _C.RESET,
+                _C.CYAN,
+                bundle_plan.bundled_file_count,
+                _C.RESET,
+                format_bytes(bundle_plan.bundled_total_bytes),
+            )
+            if bundle_plan.reused_file_count:
+                LOG.info(
+                    "%sresume%s  : %s%d%s bundled logical file(s) already present remotely and will be reused",
+                    _C.DIM,
+                    _C.RESET,
+                    _C.CYAN,
+                    bundle_plan.reused_file_count,
+                    _C.RESET,
+                )
+        else:
+            LOG.info("%sbundles%s : enabled, but no fully eligible directories met the current thresholds", _C.DIM, _C.RESET)
+    elif direction == "download" and download_bundle_enabled:
+        if download_bundle_entries:
+            LOG.info(
+                "%sbundles%s : transparent unpack via %s%d%s bundle object(s), covering %s%d%s logical files (%s)",
+                _C.DIM,
+                _C.RESET,
+                _C.CYAN,
+                len(download_bundle_entries),
+                _C.RESET,
+                _C.CYAN,
+                sum(_entry_logical_file_count(entry) for entry in download_bundle_entries),
+                _C.RESET,
+                format_bytes(sum(_entry_logical_bytes(entry) for entry in download_bundle_entries)),
+            )
+        else:
+            LOG.info("%sbundles%s : transparent unpack enabled", _C.DIM, _C.RESET)
     if direction == "download" and not args.no_stage:
         LOG.info("%sstaging%s : max-files=%d  max-bytes=%s  lifetime=%s  poll=%ds  timeout=%s",
                  _C.DIM, _C.RESET, args.stage_batch, format_bytes(args.stage_batch_bytes), args.stage_lifetime, args.stage_poll,
                  fmt_duration(args.stage_timeout))
     if pre_skipped_entries:
         LOG.info("%sresume%s  : %s%d%s already verified, skipping stage/copy for %s",
-                 _C.DIM, _C.RESET, _C.CYAN, len(pre_skipped_entries), _C.RESET,
-                 format_bytes(sum(e.get("size", 0) for e in pre_skipped_entries)))
+                 _C.DIM, _C.RESET, _C.CYAN,
+                 sum(_entry_logical_file_count(entry) for entry in pre_skipped_entries), _C.RESET,
+                 format_bytes(sum(_entry_logical_bytes(entry) for entry in pre_skipped_entries)))
     if quota and quota.ok:
         LOG.info("%squota%s   : %s", _C.DIM, _C.RESET, quota.summary_line())
     LOG.info("")
 
-    if not files:
+    has_bundle_upload_work = direction == "upload" and bundle_plan is not None and bundle_plan.bundled_file_count > 0
+    if not files and not download_bundle_entries and not has_bundle_upload_work:
         LOG.info("all planned download files are already verified locally")
         return 0
 
+    bundle_transferer: Transferer | None = None
+    bundle_xattr_client: NamespaceXattrClient | None = None
+    download_bundle_transferer: Transferer | None = None
+    download_bundle_result_handler = None
+    if bundle_plan is not None and bundle_plan.bundled_file_count:
+        assert bundle_upload_resolver is not None
+        bundle_xattr_client = bundle_upload_resolver._require_client()
+        bundle_transferer = Transferer(
+            rclone_config=rclone_config,
+            remote=remote,
+            ada_cmd=args.ada,
+            api=api,
+            max_retries=args.max_retries,
+            retry_wait=args.retry_wait,
+            copy_timeout=args.copy_timeout,
+            checksum_timeout=args.checksum_timeout,
+            skip_verified=False,
+            delete_source=False,
+        )
+    if direction == "download" and download_bundle_entries and delete_source:
+        try:
+            bundle_move_xattr_client = _get_download_bundle_resolver()._require_client()
+        except RuntimeError as exc:
+            LOG.error("%s", exc)
+            return 1
+        download_bundle_transferer = Transferer(
+            rclone_config=rclone_config,
+            remote=remote,
+            ada_cmd=args.ada,
+            api=api,
+            max_retries=args.max_retries,
+            retry_wait=args.retry_wait,
+            copy_timeout=args.copy_timeout,
+            checksum_timeout=args.checksum_timeout,
+            skip_verified=args.skip_verified,
+            delete_source=False,
+        )
+
+        def _download_bundle_result_handler(entry: dict, result: dict) -> None:
+            assert download_bundle_transferer is not None
+            _commit_bundle_download_move(entry, result, bundle_move_xattr_client, download_bundle_transferer)
+
+        download_bundle_result_handler = _download_bundle_result_handler
+
     progress = Progress(total_files=planned_total_files, total_bytes=total_bytes)
-    for entry in pre_skipped_entries:
-        progress.success(entry["rel"], entry.get("size", 0), attempts=0, skipped=True)
+    _apply_pre_skipped_entries(progress, pre_skipped_entries)
     transferer.progress = progress
+    if bundle_transferer is not None:
+        bundle_transferer.progress = progress
+    if download_bundle_transferer is not None:
+        download_bundle_transferer.progress = progress
     bar = ProgressBar(progress, quota=quota)
 
     interrupted = False
     try:
         if direction == "upload":
-            _execute_simple(files, transferer.upload, args.workers, progress, bar)
+            if files:
+                _execute_simple(files, transferer.upload, args.workers, progress, bar)
+            if bundle_plan is not None and bundle_plan.bundled_file_count:
+                assert bundle_transferer is not None
+                assert bundle_xattr_client is not None
+                _execute_bundle_uploads(
+                    bundle_plan,
+                    bundle_transferer,
+                    bundle_xattr_client,
+                    progress,
+                    bar,
+                    delete_source=delete_source,
+                    keep_temp=args.bundle_keep_temp,
+                )
         elif args.no_stage:
-            _execute_simple(files, transferer.download, args.workers, progress, bar)
+            if files:
+                _execute_simple(files, transferer.download, args.workers, progress, bar)
+            if download_bundle_entries:
+                active_bundle_download_transferer = download_bundle_transferer or transferer
+                _execute_simple(
+                    download_bundle_entries,
+                    active_bundle_download_transferer.download_bundle,
+                    args.workers,
+                    progress,
+                    bar,
+                    result_handler=download_bundle_result_handler,
+                )
         else:
             stage_mgr = StageManager(args.ada, rclone_config, api, config[remote])
-            _execute_pipeline_download(
-                files=files,
-                transferer=transferer,
-                stage_mgr=stage_mgr,
-                workers=args.workers,
-                progress=progress,
-                bar=bar,
-                stage_batch=args.stage_batch,
-                stage_batch_bytes=args.stage_batch_bytes,
-                stage_lifetime=args.stage_lifetime,
-                stage_poll=args.stage_poll,
-                stage_timeout=args.stage_timeout,
-                destage=(not args.no_destage) and (not delete_source),
-            )
+            if files:
+                _execute_pipeline_download(
+                    files=files,
+                    transferer=transferer,
+                    stage_mgr=stage_mgr,
+                    workers=args.workers,
+                    progress=progress,
+                    bar=bar,
+                    stage_batch=args.stage_batch,
+                    stage_batch_bytes=args.stage_batch_bytes,
+                    stage_lifetime=args.stage_lifetime,
+                    stage_poll=args.stage_poll,
+                    stage_timeout=args.stage_timeout,
+                    destage=(not args.no_destage) and (not delete_source),
+                    worker_fn=transferer.download,
+                )
+            if download_bundle_entries:
+                active_bundle_download_transferer = download_bundle_transferer or transferer
+                _execute_pipeline_download(
+                    files=download_bundle_entries,
+                    transferer=active_bundle_download_transferer,
+                    stage_mgr=stage_mgr,
+                    workers=args.workers,
+                    progress=progress,
+                    bar=bar,
+                    stage_batch=args.stage_batch,
+                    stage_batch_bytes=args.stage_batch_bytes,
+                    stage_lifetime=args.stage_lifetime,
+                    stage_poll=args.stage_poll,
+                    stage_timeout=args.stage_timeout,
+                    destage=(not args.no_destage) and (not delete_source),
+                    worker_fn=active_bundle_download_transferer.download_bundle,
+                    result_handler=download_bundle_result_handler,
+                )
     except KeyboardInterrupt:
         interrupted = True
     finally:
@@ -2960,6 +5065,11 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
         bar.finish()
         if quota_poller:
             quota_poller.stop()
+        transferer.close()
+        if bundle_transferer is not None:
+            bundle_transferer.close()
+        if download_bundle_transferer is not None:
+            download_bundle_transferer.close()
 
     if interrupted:
         LOG.warning("interrupted")
