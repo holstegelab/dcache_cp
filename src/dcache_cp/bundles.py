@@ -799,6 +799,7 @@ def materialize_bundle_job(job: BundleJob, *, keep_temp: bool = False) -> dict:
                     "-b",
                     str(DEFAULT_SQUASHFS_BLOCK_SIZE),
                     "-no-duplicates",
+                    "-no-xattrs",
                     "-noappend",
                     "-quiet",
                 ],

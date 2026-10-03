@@ -42,6 +42,7 @@ from .cli import (
     resolve_remote_name,
     resolve_api_url,
     run_command,
+    run_ada,
 )
 from .xattrs import NamespaceXattrClient, NamespaceXattrError, extract_bearer_token
 
@@ -768,9 +769,8 @@ def _render_short(rows: list[_Row]):
 # Listing via ada --stat  (single-item or directory children)
 # ---------------------------------------------------------------------------
 
-def _ada_stat(ada_cmd: str, tokenfile: Path, api: str | None, remote_path: str) -> dict:
-    cmd = _ada_tokenfile_cmd(ada_cmd, tokenfile, api) + ["--stat", "/" + remote_path.strip("/")]
-    result = run_command(cmd, check=False)
+def _ada_stat(ada_cmd: str, tokenfile: Path, api: str | None, remote_path: str, remote: str | None = None) -> dict:
+    result = run_ada(ada_cmd, tokenfile, api, ["--stat", "/" + remote_path.strip("/")], remote=remote, check=False)
     if result.returncode != 0:
         raise RuntimeError(
             f"ada --stat failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -791,9 +791,8 @@ def _ada_stat(ada_cmd: str, tokenfile: Path, api: str | None, remote_path: str) 
         )
 
 
-def _ada_checksum(ada_cmd: str, tokenfile: Path, api: str | None, remote_path: str) -> str:
-    cmd = _ada_tokenfile_cmd(ada_cmd, tokenfile, api) + ["--checksum", "/" + remote_path.strip("/")]
-    result = run_command(cmd, check=False)
+def _ada_checksum(ada_cmd: str, tokenfile: Path, api: str | None, remote_path: str, remote: str | None = None) -> str:
+    result = run_ada(ada_cmd, tokenfile, api, ["--checksum", "/" + remote_path.strip("/")], remote=remote, check=False)
     if result.returncode != 0:
         return "-"
     for token in result.stdout.strip().split():
@@ -814,9 +813,10 @@ def _list_path(
     show_pin: bool,
     show_checksum: bool,
     show_all: bool = False,
+    remote: str | None = None,
 ) -> list[_Row]:
     """List a single remote path. Returns rows for rendering."""
-    data = _ada_stat(ada_cmd, tokenfile, api, remote_path)
+    data = _ada_stat(ada_cmd, tokenfile, api, remote_path, remote)
 
     entries: list[dict]
     is_directory_listing = isinstance(data, dict) and isinstance(data.get("children"), list)
@@ -842,8 +842,8 @@ def _list_path(
 
         cksum = ""
         if show_checksum and file_type != "DIR":
-            full_path = remote_path.rstrip("/") + "/" + name.rstrip("/") if len(entries) > 1 else remote_path
-            cksum = _ada_checksum(ada_cmd, tokenfile, api, full_path)
+            full_path = remote_path.rstrip("/") + "/" + name.rstrip("/") if isinstance(data.get("children"), list) else remote_path
+            cksum = _ada_checksum(ada_cmd, tokenfile, api, full_path, remote)
 
         locality = str(e.get("fileLocality", "-")) if file_type != "DIR" else ""
 
@@ -885,12 +885,13 @@ def _list_recursive(
     show_bundle_path: bool,
     bundle_resolver: _BundleLsResolver | None,
     _first: bool = True,
+    remote: str | None = None,
 ) -> None:
     """Recursively list a directory tree."""
     physical_rows = _list_path(
         ada_cmd, tokenfile, api, remote_path,
         human=human, show_pin=show_pin, show_checksum=show_checksum,
-        show_all=show_all,
+        show_all=show_all, remote=remote,
     )
 
     groups: list[_BundleGroupView] = []
@@ -931,7 +932,7 @@ def _list_recursive(
                 show_all=show_all,
                 show_bundle_path=show_bundle_path,
                 bundle_resolver=bundle_resolver,
-                _first=False,
+                remote=remote, _first=False,
             )
 
 
@@ -1005,7 +1006,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--remote", default=os.environ.get("RCLONE_REMOTE"),
                    help="rclone remote name (default: only section in config)")
-    p.add_argument("--ada", default=_default_ada(),
+    p.add_argument("--ada",
                    help="ada executable (default: bundled or $ADA)")
     p.add_argument("--api", help="dCache API URL override")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1028,6 +1029,7 @@ def main() -> int:
     config = load_rclone_config(rclone_config)
     remote = resolve_remote_name(config, args.remote)
     api = resolve_api_url(args.api, config[remote])
+    args.ada = args.ada or _default_ada()
 
     # Defaults: show locality in long mode
     show_locality = args.locality if args.locality is not None else args.long
@@ -1046,6 +1048,7 @@ def main() -> int:
                 human=args.human_readable,
                 show_pin=args.pin,
                 show_checksum=args.checksum,
+                remote=remote,
                 long_format=args.long,
                 show_locality=show_locality,
                 show_bundles=show_bundles,
@@ -1063,7 +1066,7 @@ def main() -> int:
                     human=args.human_readable,
                     show_pin=args.pin,
                     show_checksum=args.checksum,
-                    show_all=args.all,
+                    show_all=args.all, remote=remote,
                 )
             except RuntimeError:
                 if bundle_resolver is None:
@@ -1107,7 +1110,7 @@ def main() -> int:
         if exc.stderr:
             print(exc.stderr.strip(), file=sys.stderr)
         return 1
-    except RuntimeError as exc:
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except FileNotFoundError as exc:

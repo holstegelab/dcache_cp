@@ -31,12 +31,12 @@ class PlanDownloadSingleFileTests(unittest.TestCase):
             "IsDir": False,
         }]
         with mock.patch.object(cli, "_rclone_lsjson", return_value=listing), \
-                mock.patch.object(cli, "_rclone_path_is_file", return_value=True) as is_file:
+                mock.patch.object(cli, "_rclone_stat", return_value=listing[0]) as is_file:
             out = cli.plan_download(
                 self.config,
                 "dcache",
                 "releases/release1/all_combined_v5.tsv",
-                Path("/local/ades_release1"),
+                "/local/ades_release1/",
                 recursive=False,
             )
 
@@ -51,9 +51,9 @@ class PlanDownloadSingleFileTests(unittest.TestCase):
             {"Path": "a.tsv", "Size": 10, "IsDir": False},
             {"Path": "b.tsv", "Size": 20, "IsDir": False},
         ]
-        # Multiple entries => never the single-file branch; stat must not be consulted.
+        # Stat identifies a directory before listing its children.
         with mock.patch.object(cli, "_rclone_lsjson", return_value=listing), \
-                mock.patch.object(cli, "_rclone_path_is_file") as is_file:
+                mock.patch.object(cli, "_rclone_stat", return_value={"IsDir": True}) as is_file:
             out = cli.plan_download(
                 self.config,
                 "dcache",
@@ -62,7 +62,7 @@ class PlanDownloadSingleFileTests(unittest.TestCase):
                 recursive=False,
             )
 
-        is_file.assert_not_called()
+        is_file.assert_called_once()
         self.assertEqual(
             sorted(e["remote_path"] for e in out),
             ["releases/release1/a.tsv", "releases/release1/b.tsv"],
@@ -73,7 +73,7 @@ class PlanDownloadSingleFileTests(unittest.TestCase):
         # but stat reports a directory, so the basename heuristic must defer to it.
         listing = [{"Path": "foo", "Size": 5, "IsDir": False}]
         with mock.patch.object(cli, "_rclone_lsjson", return_value=listing), \
-                mock.patch.object(cli, "_rclone_path_is_file", return_value=False) as is_file:
+                mock.patch.object(cli, "_rclone_stat", return_value={"IsDir": True}) as is_file:
             out = cli.plan_download(
                 self.config,
                 "dcache",

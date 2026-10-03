@@ -148,9 +148,9 @@ class TransfererDownloadTests(unittest.TestCase):
             stderr="",
         )
 
-        with mock.patch.object(cli, "run_command", side_effect=[transient, success]) as run_mock, mock.patch.object(
-            cli.time,
-            "sleep",
+        with mock.patch.object(cli, "run_ada", side_effect=[transient, success]) as run_mock, mock.patch.object(
+            transferer.cancel_event,
+            "wait", return_value=False,
         ) as sleep_mock:
             adler = transferer._remote_adler(remote_path)
 
@@ -379,6 +379,50 @@ class TransfererDownloadTests(unittest.TestCase):
         transferer = self._make_transferer(skip_verified=True)
         with self.assertRaisesRegex(RuntimeError, "unsupported bundle format"):
             transferer._extract_bundle_members(Path("unused.dcpbundle"), [], bundle_format="tar")
+
+    def test_bundle_download_keeps_destination_changed_during_transfer(self) -> None:
+        transferer = self._make_transferer(skip_verified=False)
+        target = self.root / "output.txt"
+        target.write_bytes(b"OLD")
+        temporary = self.root / "verified.part"
+        temporary.write_bytes(b"NEW")
+        member = {"local_path": target, "rel": "output.txt", "size": 3, "mode": 0o644}
+        entry = {"remote_path": "bundle.dcpbundle", "rel": "bundle", "bundle_members": [member]}
+
+        def copy(_source, destination):
+            Path(destination).write_bytes(b"BUNDLE")
+            target.write_bytes(b"CHANGED_DURING_TRANSFER")
+
+        with mock.patch.object(transferer, "_should_try_sparse_bundle_read", return_value=False), \
+                mock.patch.object(transferer, "_rclone_copyto", side_effect=copy), \
+                mock.patch.object(transferer, "_remote_adler", return_value=_adler_hex(b"BUNDLE")), \
+                mock.patch.object(transferer, "_extract_bundle_members", return_value=[(temporary, target, member)]):
+            with self.assertRaises(cli.SourceChangedError):
+                transferer.download_bundle(entry)
+        self.assertEqual(target.read_bytes(), b"CHANGED_DURING_TRANSFER")
+        self.assertFalse(temporary.exists())
+
+    def test_cancelled_bundle_download_does_not_replace_destination(self) -> None:
+        transferer = self._make_transferer(skip_verified=False)
+        target = self.root / "output.txt"
+        target.write_bytes(b"OLD")
+        temporary = self.root / "verified.part"
+        temporary.write_bytes(b"NEW")
+        member = {"local_path": target, "rel": "output.txt", "size": 3, "mode": 0o644}
+        entry = {"remote_path": "bundle.dcpbundle", "rel": "bundle", "bundle_members": [member]}
+
+        def extract(*args, **kwargs):
+            transferer.cancel()
+            return [(temporary, target, member)]
+
+        with mock.patch.object(transferer, "_should_try_sparse_bundle_read", return_value=False), \
+                mock.patch.object(transferer, "_rclone_copyto", side_effect=lambda src, dst: Path(dst).write_bytes(b"BUNDLE")), \
+                mock.patch.object(transferer, "_remote_adler", return_value=_adler_hex(b"BUNDLE")), \
+                mock.patch.object(transferer, "_extract_bundle_members", side_effect=extract):
+            with self.assertRaises(cli.TransferCancelled):
+                transferer.download_bundle(entry)
+        self.assertEqual(target.read_bytes(), b"OLD")
+        self.assertFalse(temporary.exists())
 
     def test_extract_squashfs_bundle_members_uses_nonexistent_unsquashfs_dest(self) -> None:
         transferer = self._make_transferer(skip_verified=True)

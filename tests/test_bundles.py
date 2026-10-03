@@ -165,7 +165,10 @@ class CliBundleExecutionTests(unittest.TestCase):
         ), mock.patch.object(
             cli, "Transferer", _FakeTransferer
         ), mock.patch.object(
-            cli, "_execute_bundle_uploads"
+            cli, "_execute_bundle_uploads",
+            side_effect=lambda plan, transferer, client, progress, bar, **kwargs: progress.success(
+                "a.txt", 5, attempts=0, skipped=True
+            ),
         ) as execute_bundle_uploads:
             rc = cli.main([
                 "--bundle-small-files",
@@ -303,7 +306,9 @@ class BundlePlanningTests(unittest.TestCase):
         self.assertFalse(materialized["bundle_keep_temp"])
         self.assertEqual(job.bundle_object_xattrs["dcache_cp.bundle.format"], "squashfs")
 
-        extract_root = Path(tempfile.mkdtemp(prefix="bundle-test-unsquashfs-"))
+        extract_parent = Path(tempfile.mkdtemp(prefix="bundle-test-unsquashfs-"))
+        self.addCleanup(shutil.rmtree, extract_parent, True)
+        extract_root = extract_parent / "extract"
         self.addCleanup(shutil.rmtree, extract_root, True)
         result = subprocess.run(
             ["unsquashfs", "-no-progress", "-dest", str(extract_root), str(materialized["resolved_source"])],
@@ -361,7 +366,9 @@ class BundlePlanningTests(unittest.TestCase):
         resolver = cli._BundleDownloadResolver(config, "dcache", "https://example.invalid", None)
         resolver.xattr_client = _ListXattrClient()
 
-        with mock.patch.object(cli, "_rclone_lsjson", return_value=listing):
+        with mock.patch.object(cli, "_rclone_lsjson", return_value=listing), mock.patch.object(
+            cli, "_rclone_stat", return_value={"IsDir": True}
+        ):
             plain_entries, bundle_entries = cli._plan_download_source_with_bundles(
                 config,
                 "dcache",
@@ -457,7 +464,9 @@ class BundlePlanningTests(unittest.TestCase):
             self.fail(f"unexpected lsjson path: {remote_path}")
 
         local_dest = self.root / "downloads" / "del1.bin"
-        with mock.patch.object(cli, "_rclone_lsjson", side_effect=fake_lsjson):
+        with mock.patch.object(cli, "_rclone_lsjson", side_effect=fake_lsjson), mock.patch.object(
+            cli, "_rclone_stat", side_effect=FileNotFoundError("logical member has no physical file")
+        ):
             plain_entries, bundle_entries = cli._plan_download_source_with_bundles(
                 config,
                 "dcache",
@@ -545,7 +554,9 @@ class BundlePlanningTests(unittest.TestCase):
                 )
             self.fail(f"unexpected lsjson path: {remote_path}")
 
-        with mock.patch.object(cli, "_rclone_lsjson", side_effect=fake_lsjson):
+        with mock.patch.object(cli, "_rclone_lsjson", side_effect=fake_lsjson), mock.patch.object(
+            cli, "_rclone_stat", side_effect=FileNotFoundError("logical member has no physical file")
+        ):
             plain_entries, bundle_entries = cli._plan_file_list_downloads_with_bundles(
                 config,
                 "dcache",

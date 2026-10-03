@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import configparser
+from contextlib import contextmanager
 import csv
 import hashlib
 import json
@@ -36,6 +37,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -44,6 +46,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zlib
 from pathlib import Path
 
@@ -83,6 +86,7 @@ from .xattrs import NamespaceXattrClient, NamespaceXattrError, extract_bearer_to
 LOG = logging.getLogger("dcache_cp")
 
 DEFAULT_COPY_TIMEOUT = "300m"
+DEFAULT_COMMAND_TIMEOUT = 120  # seconds for metadata and management commands
 DEFAULT_CHECKSUM_TIMEOUT = 4 * 3600  # 4 h — TB-class files can take hours
 DEFAULT_STAGE_TIMEOUT = 86400  # 24 h
 DEFAULT_STAGE_POLL = 60  # seconds
@@ -424,7 +428,7 @@ def load_rclone_config(path: Path) -> configparser.ConfigParser:
     if not resolved.exists():
         searched = ", ".join(str(c.expanduser()) for c in DEFAULT_RCLONE_CONFIG_CANDIDATES)
         raise FileNotFoundError(f"rclone config not found: {resolved}. Also checked: {searched}")
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     with resolved.open("r", encoding="utf-8") as fh:
         parser.read_file(fh)
     if not parser.sections():
@@ -502,30 +506,104 @@ def resolve_api_url(explicit: str | None, remote_cfg: configparser.SectionProxy)
 # Shell commands
 # ---------------------------------------------------------------------------
 
-def run_command(cmd: list[str], check: bool = True,
-                log_errors: bool = True) -> subprocess.CompletedProcess:
-    """Run a subprocess and return its result.
+class SourceChangedError(RuntimeError):
+    pass
 
-    *log_errors*: when True (default), log stdout/stderr at ERROR on failure.
-    Set to False when the caller expects and handles certain non-zero exits
-    (e.g. rclone lsjson on missing bundled dirs, ada 429 rate-limits) to
-    avoid spurious ERROR lines.
-    """
-    LOG.debug("cmd: %s", " ".join(shlex.quote(str(x)) for x in cmd))
+
+class TransferCancelled(RuntimeError):
+    pass
+
+
+def run_command(cmd: list[str], check: bool = True, *, timeout: float | None = DEFAULT_COMMAND_TIMEOUT,
+                cancel_event: threading.Event | None = None, secrets: tuple[str, ...] = (), quiet: bool = False) -> subprocess.CompletedProcess:
+    """Run a bounded command; stop its entire process group on cancellation."""
+    def redacted(value: str | None) -> str:
+        value = _redact_http_secrets(value or "")
+        for secret in secrets:
+            value = value.replace(secret, "<redacted>")
+        return value
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise TransferCancelled("transfer cancelled")
+    if not quiet:
+        LOG.debug("cmd: %s", redacted(shlex.join([str(x) for x in cmd])))
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    deadline = time.monotonic() + timeout if timeout is not None else None
     try:
-        result = subprocess.run(cmd, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except subprocess.CalledProcessError as exc:
-        level = logging.ERROR if log_errors else logging.DEBUG
-        if exc.stdout:
-            LOG.log(level, "stdout: %s", exc.stdout.strip())
-        if exc.stderr:
-            LOG.log(level, "stderr: %s", exc.stderr.strip())
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("transfer cancelled")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.2, max(deadline - time.monotonic(), 0.001)) if deadline else 0.2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=1)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
         raise
-    if result.stdout:
-        LOG.debug("stdout: %s", result.stdout.strip())
-    if result.stderr:
-        LOG.debug("stderr: %s", result.stderr.strip())
+    result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+    if result.stdout and not quiet:
+        LOG.debug("stdout: %s", redacted(result.stdout).strip())
+    if result.stderr and not quiet:
+        LOG.debug("stderr: %s", redacted(result.stderr).strip())
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=redacted(stdout), stderr=redacted(stderr))
     return result
+
+
+def _resolve_bearer_token(remote_cfg: configparser.SectionProxy, *, timeout: float = DEFAULT_COMMAND_TIMEOUT, cancel_event=None) -> str:
+    token = remote_cfg.get("bearer_token", "").strip()
+    command = remote_cfg.get("bearer_token_command", "").strip()
+    if not token and command:
+        # Token command output is a credential, so never send it through logging.
+        try:
+            result = run_command(shlex.split(command), timeout=timeout, cancel_event=cancel_event, check=False, quiet=True)
+        except subprocess.SubprocessError:
+            raise RuntimeError("configured bearer token command failed or timed out") from None
+        if result.returncode:
+            raise RuntimeError("configured bearer token command failed")
+        token = result.stdout.strip()
+    if not token or "\n" in token or "\r" in token:
+        raise ValueError("selected remote must provide one bearer token or bearer_token_command")
+    return token
+
+
+@contextmanager
+def _ada_tokenfile(config_path: Path, remote: str | None = None, *, timeout: float = DEFAULT_COMMAND_TIMEOUT, cancel_event=None):
+    """Give ADA only the selected remote's token, in an owner-only file."""
+    config = load_rclone_config(config_path)
+    section = config[resolve_remote_name(config, remote)]
+    token = _resolve_bearer_token(section, timeout=timeout, cancel_event=cancel_event)
+    selected = configparser.ConfigParser(interpolation=None)
+    selected["dcache"] = {"url": section.get("url", ""), "bearer_token": token}
+    with tempfile.NamedTemporaryFile("w", suffix=".conf") as fh:
+        selected.write(fh)
+        fh.flush()
+        yield Path(fh.name), token
+
+
+def run_ada(ada_cmd: str, config_path: Path, api: str | None, arguments: list[str], *,
+            remote: str | None = None, check: bool = True, timeout: float = DEFAULT_COMMAND_TIMEOUT,
+            cancel_event: threading.Event | None = None):
+    deadline = time.monotonic() + timeout
+    with _ada_tokenfile(config_path, remote, timeout=timeout, cancel_event=cancel_event) as (tokenfile, token):
+        cmd = [ada_cmd, "--tokenfile", str(tokenfile)]
+        if api:
+            cmd += ["--api", api]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("ADA command deadline exceeded while resolving credentials")
+        return run_command(cmd + arguments, check=check, timeout=remaining, cancel_event=cancel_event, secrets=(token,))
 
 
 # ---------------------------------------------------------------------------
@@ -664,9 +742,11 @@ class _ChecksumCache:
             if cache_path not in self._data:
                 self._data[cache_path] = self._load(cache_path)
             entry = self._data[cache_path].get(local_path.name)
-        if (entry
-                and entry.get("size") == st.st_size
-                and entry.get("mtime_ns") == st.st_mtime_ns):
+        # Filesystem clocks can coalesce several writes into one timestamp tick.
+        # Only reuse a checksum computed after the file had settled for a second.
+        if (isinstance(entry, dict)
+                and entry.get("fingerprint") == list(_file_fingerprint(st))
+                and entry.get("cached_at_ns", 0) - st.st_ctime_ns >= 1_000_000_000):
             return entry["adler32"]
         return None
 
@@ -680,6 +760,8 @@ class _ChecksumCache:
                 "adler32": adler_str,
                 "size": st.st_size,
                 "mtime_ns": st.st_mtime_ns,
+                "fingerprint": list(_file_fingerprint(st)),
+                "cached_at_ns": time.time_ns(),
             }
             self._dirty.add(cache_path)
 
@@ -692,11 +774,13 @@ class _ChecksumCache:
         for cache_path, data in snapshot.items():
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = cache_path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                with tempfile.NamedTemporaryFile("w", dir=cache_path.parent, delete=False) as fh:
+                    tmp = Path(fh.name)
+                    json.dump(data, fh)
                 tmp.replace(cache_path)
                 with self._lock:
-                    self._dirty.discard(cache_path)
+                    if self._data[cache_path] == data:
+                        self._dirty.discard(cache_path)
             except OSError as exc:
                 LOG.debug("could not write checksum cache %s: %s", cache_path, exc)
 
@@ -708,7 +792,8 @@ class _ChecksumCache:
     @staticmethod
     def _load(cache_path: Path) -> dict:
         try:
-            return json.loads(cache_path.read_text(encoding="utf-8"))
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
 
@@ -716,21 +801,33 @@ class _ChecksumCache:
 _checksum_cache = _ChecksumCache()
 
 
-def adler32_local(local_path: Path) -> str:
+def _file_fingerprint(st: os.stat_result) -> tuple[int, ...]:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def adler32_local(local_path: Path, *, use_cache: bool = True, cancel_event: threading.Event | None = None) -> str:
     """Return the Adler-32 of a local file, using the shared in-process cache.
 
     Cache hits are served from memory (no I/O).  Misses compute the checksum
     outside any lock and queue the result for the next background flush.
     """
     st = local_path.stat()
-    cached = _checksum_cache.get(local_path, st)
+    cached = _checksum_cache.get(local_path, st) if use_cache else None
     if cached is not None:
         return cached
 
     adler = 1
     with local_path.open("rb") as fh:
+        if _file_fingerprint(os.fstat(fh.fileno())) != _file_fingerprint(st):
+            raise SourceChangedError(f"file changed before hashing: {local_path}")
         for chunk in iter(lambda: fh.read(16 * 1024 * 1024), b""):
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("hashing cancelled")
             adler = zlib.adler32(chunk, adler)
+        if _file_fingerprint(os.fstat(fh.fileno())) != _file_fingerprint(st):
+            raise SourceChangedError(f"file changed while hashing: {local_path}")
+    if _file_fingerprint(local_path.stat()) != _file_fingerprint(st):
+        raise SourceChangedError(f"file changed while hashing: {local_path}")
     adler_str = f"{adler & 0xFFFFFFFF:08x}"
 
     _checksum_cache.put(local_path, adler_str, st)
@@ -787,6 +884,8 @@ class _DaemonWorkerPool:
             try:
                 if entry is self._sentinel:
                     return
+                if self._stop.is_set():
+                    continue
                 try:
                     result = self._worker_fn(entry)
                 except BaseException as exc:
@@ -816,6 +915,9 @@ class _DaemonWorkerPool:
 
     def stop(self) -> None:
         self._stop.set()
+        owner = getattr(self._worker_fn, "__self__", None)
+        if isinstance(owner, (Transferer, StageManager)):
+            owner.cancel()
         self.finish_submissions()
 
     def join(self, timeout: float = 1.0) -> None:
@@ -843,7 +945,7 @@ def load_file_list(path: Path, *, allow_missing_local: bool = False) -> tuple[st
         for lineno, row in enumerate(reader, 1):
             if not row or row[0].strip().startswith("#"):
                 continue
-            if len(row) < 2:
+            if len(row) != 2:
                 raise ValueError(f"{path}:{lineno}: expected 2 tab-separated columns, got {len(row)}")
 
             src_raw, dst_raw = row[0].strip(), row[1].strip()
@@ -870,7 +972,8 @@ def load_file_list(path: Path, *, allow_missing_local: bool = False) -> tuple[st
                 )
 
             if row_dir == "upload":
-                local = Path(src_path).expanduser().resolve()
+                raw_local = Path(src_path).expanduser()
+                local = raw_local.parent.resolve() / raw_local.name
                 if not local.is_file():
                     if not allow_missing_local:
                         raise FileNotFoundError(f"{path}:{lineno}: local file not found: {local}")
@@ -887,7 +990,7 @@ def load_file_list(path: Path, *, allow_missing_local: bool = False) -> tuple[st
                 st = local.stat()
                 entries.append({
                     "source": local,
-                    "resolved_source": local,
+                    "resolved_source": local.resolve(),
                     "rel": local.name,
                     "size": st.st_size,
                     "remote_path": dst_path.strip("/"),
@@ -908,7 +1011,7 @@ def load_file_list(path: Path, *, allow_missing_local: bool = False) -> tuple[st
     if direction is None:
         raise ValueError(f"file list is empty: {path}")
 
-    prefixes = {e.pop("_prefix") for e in entries}
+    prefixes = {e["_prefix"] for e in entries}
     if len(prefixes) > 1:
         raise ValueError(f"file list mixes remote prefixes: {prefixes}; use a single prefix")
 
@@ -933,7 +1036,7 @@ def _rclone_lsjson(
     if recursive:
         cmd.append("--recursive")
 
-    result = run_command(cmd, check=not missing_ok, log_errors=False)
+    result = run_command(cmd, check=not missing_ok)
     if result.returncode != 0:
         if missing_ok:
             return []
@@ -942,30 +1045,6 @@ def _rclone_lsjson(
     if not isinstance(entries, list):
         raise ValueError(f"unexpected lsjson output for {target}")
     return entries
-
-
-def _rclone_path_is_file(rclone_config: Path, remote: str, remote_path: str) -> bool:
-    """Return True if ``remote_path`` is a regular file (not a directory).
-
-    Uses ``rclone lsjson --stat`` which describes the path *itself*: a file
-    yields ``IsDir=false`` with ``Path`` set to its basename, a directory yields
-    ``IsDir=true`` with an empty ``Path``.  Used to disambiguate a single-file
-    source from a directory whose one child happens to share its name.
-    """
-    remote_path = remote_path.strip("/")
-    target = f"{remote}:{remote_path}" if remote_path else f"{remote}:"
-    cmd = [
-        "rclone", "--config", str(rclone_config),
-        "lsjson", "--stat", target,
-    ]
-    result = run_command(cmd, check=False, log_errors=False)
-    if result.returncode != 0:
-        return False
-    try:
-        info = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return False
-    return isinstance(info, dict) and not info.get("IsDir", True)
 
 
 def _rclone_lsjson_reports_missing_path(exc: subprocess.CalledProcessError) -> bool:
@@ -982,6 +1061,19 @@ def _rclone_lsjson_reports_missing_path(exc: subprocess.CalledProcessError) -> b
             "file not found",
         )
     )
+
+
+def _rclone_stat(rclone_config: Path, remote: str, remote_path: str) -> dict:
+    """Return metadata for the requested object, rather than its contents."""
+    remote_path = remote_path.strip("/")
+    target = f"{remote}:{remote_path}" if remote_path else f"{remote}:"
+    result = run_command([
+        "rclone", "--config", str(rclone_config), "lsjson", target, "--stat",
+    ])
+    entry = json.loads(result.stdout)
+    if not isinstance(entry, dict) or not isinstance(entry.get("IsDir"), bool):
+        raise ValueError(f"unexpected lsjson --stat output for {target}")
+    return entry
 
 
 def _fill_file_list_download_sizes(
@@ -1089,9 +1181,12 @@ def _filter_resumed_move_upload_file_list_entries(
 # ---------------------------------------------------------------------------
 
 def plan_upload(source: Path, destination: str, recursive: bool,
-                spinner: "_EnumSpinner | None" = None) -> list[dict]:
+                spinner: "_EnumSpinner | None" = None, *, move: bool = False) -> list[dict]:
     """Enumerate local files and map them to remote paths."""
-    source = source.expanduser().resolve()
+    source = source.expanduser()
+    source = source.parent.resolve() / source.name
+    if move and source.is_symlink() and source.is_dir():
+        raise ValueError("cannot move through a directory symlink; use its explicit target path")
     if not source.exists():
         raise FileNotFoundError(f"source does not exist: {source}")
 
@@ -1134,31 +1229,34 @@ def plan_upload(source: Path, destination: str, recursive: bool,
 
 def plan_download(
     rclone_config: Path, remote: str, remote_path: str,
-    local_dest: Path, recursive: bool,
+    local_dest: Path | str, recursive: bool,
     spinner: "_EnumSpinner | None" = None,
 ) -> list[dict]:
     """Enumerate remote files via ``rclone lsjson`` and map them to local paths."""
-    entries = _rclone_lsjson(rclone_config, remote, remote_path, recursive=recursive)
     remote_path = remote_path.strip("/")
     if not remote_path:
         raise ValueError("remote path must not be empty")
 
-    local_dest = local_dest.expanduser().resolve()
+    dest_is_dir = str(local_dest).endswith("/")
+    local_dest = Path(local_dest).expanduser().resolve()
+    source = _rclone_stat(rclone_config, remote, remote_path)
+
+    if not source["IsDir"]:
+        name = posixpath.basename(remote_path)
+        local_target = local_dest / name if dest_is_dir or local_dest.is_dir() else local_dest
+        if spinner:
+            spinner.tick()
+        return [{
+            "remote_path": remote_path,
+            "local_path": local_target,
+            "rel": name,
+            "size": source.get("Size", 0),
+        }]
+
+    entries = _rclone_lsjson(rclone_config, remote, remote_path, recursive=recursive)
 
     if not entries:
         raise FileNotFoundError(f"no files found at remote path: {remote_path}")
-
-    # ``rclone lsjson`` on a *file* returns a single non-dir entry whose ``Path``
-    # is the file's own basename.  In that case ``remote_path`` already is the
-    # full file path, so joining it with the basename would yield ``<file>/<file>``
-    # and a 404.  Confirm with an explicit stat to avoid mis-detecting a directory
-    # that contains exactly one equally-named child file.
-    source_is_file = (
-        len(entries) == 1
-        and not entries[0].get("IsDir", False)
-        and entries[0].get("Path") == posixpath.basename(remote_path)
-        and _rclone_path_is_file(rclone_config, remote, remote_path)
-    )
 
     out: list[dict] = []
     for entry in entries:
@@ -1166,7 +1264,7 @@ def plan_download(
             continue
         rel = entry["Path"]
         size = entry.get("Size", 0)
-        file_remote = remote_path if source_is_file else posixpath.join(remote_path, rel)
+        file_remote = posixpath.join(remote_path, rel)
         local_target = local_dest / rel
         out.append({
             "remote_path": file_remote,
@@ -1801,17 +1899,19 @@ def _plan_download_source_with_bundles(
     rclone_config: Path,
     remote: str,
     remote_path: str,
-    local_dest: Path,
+    local_dest: Path | str,
     recursive: bool,
     resolver: _BundleDownloadResolver,
     spinner: "_EnumSpinner | None" = None,
 ) -> tuple[list[dict], list[dict]]:
     remote_path = str(remote_path).strip("/")
-    local_dest = local_dest.expanduser().resolve()
+    destination_raw = local_dest
+    dest_is_dir = str(destination_raw).endswith("/")
+    local_dest = Path(local_dest).expanduser().resolve()
 
     if not recursive:
         try:
-            return plan_download(rclone_config, remote, remote_path, local_dest, recursive=False, spinner=spinner), []
+            return plan_download(rclone_config, remote, remote_path, destination_raw, recursive=False, spinner=spinner), []
         except FileNotFoundError:
             pass
         except subprocess.CalledProcessError as exc:
@@ -1824,7 +1924,7 @@ def _plan_download_source_with_bundles(
 
         logical_entry = {
             "remote_path": remote_path,
-            "local_path": local_dest,
+            "local_path": local_dest / posixpath.basename(remote_path) if dest_is_dir or local_dest.is_dir() else local_dest,
             "rel": posixpath.basename(remote_path),
         }
         resolved = resolver.resolve_logical_entry(logical_entry)
@@ -1909,6 +2009,33 @@ def _bundle_entry_fully_verified(entry: dict) -> bool:
     return True
 
 
+def _validate_transfer_plan(files: list[dict], direction: str, move: bool = False) -> None:
+    destinations: set[str] = set()
+    sources: set[str] = set()
+    logical_entries = [member for entry in files for member in (_bundle_members_for_entry(entry) or [entry])]
+    for entry in logical_entries:
+        if direction == "upload":
+            destination = posixpath.normpath("/" + entry["remote_path"].strip("/"))
+            source = str(Path(entry["source"]).parent.resolve() / Path(entry["source"]).name)
+        else:
+            destination = str(Path(entry["local_path"]).resolve())
+            source = posixpath.normpath("/" + entry["remote_path"].strip("/"))
+        if destination in destinations:
+            raise ValueError(f"multiple inputs have the same destination: {destination}")
+        if move and source in sources:
+            raise ValueError(f"a move source appears more than once: {source}; copy to all destinations before moving")
+        if not str(entry["remote_path"]).strip("/"):
+            raise ValueError("remote file path must not be empty")
+        destinations.add(destination)
+        sources.add(source)
+    for destination in destinations:
+        parent = posixpath.dirname(destination)
+        while parent and parent != "/":
+            if parent in destinations:
+                raise ValueError(f"overlapping destination paths: {parent} and {destination}")
+            parent = posixpath.dirname(parent)
+
+
 # ---------------------------------------------------------------------------
 # Quota tracking
 # ---------------------------------------------------------------------------
@@ -1916,11 +2043,13 @@ def _bundle_entry_fully_verified(entry: dict) -> bool:
 class QuotaTracker:
     """Periodically query ``ada --space`` and expose usage for display."""
 
-    def __init__(self, ada_cmd: str, tokenfile: Path, api: str | None, poolgroup: str):
+    def __init__(self, ada_cmd: str, tokenfile: Path, api: str | None, poolgroup: str, remote: str | None = None):
         self.ada_cmd = ada_cmd
         self.tokenfile = tokenfile
         self.api = api
         self.poolgroup = poolgroup
+        self.remote = remote
+        self.cancel_event = threading.Event()
         self.total = 0
         self.free = 0
         self.precious = 0
@@ -1932,8 +2061,17 @@ class QuotaTracker:
 
     def refresh(self):
         """Fetch current quota from ada --space.  Non-fatal on failure."""
-        cmd = _ada_tokenfile_cmd(self.ada_cmd, self.tokenfile, self.api) + ["--space", self.poolgroup]
-        result = run_command(cmd, check=False)
+        if self.cancel_event.is_set():
+            return
+        try:
+            result = run_ada(self.ada_cmd, self.tokenfile, self.api, ["--space", self.poolgroup], remote=self.remote,
+                             check=False, cancel_event=self.cancel_event)
+        except TransferCancelled:
+            return
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+            with self.lock:
+                self._ok = False
+            return
         if result.returncode != 0:
             with self.lock:
                 self._ok = False
@@ -1991,6 +2129,7 @@ class _QuotaPoller:
 
     def stop(self):
         self._stop.set()
+        self.tracker.cancel_event.set()
         if self._thread:
             self._thread.join(timeout=5)
 
@@ -2415,8 +2554,10 @@ def print_summary(
 
     if interrupted:
         status = f"{_C.YELLOW}{_C.BOLD}! INTERRUPTED{_C.RESET}"
-    elif not progress.failed:
+    elif not progress.failed and progress.validated_files == progress.total_files:
         status = f"{_C.GREEN}{_C.BOLD}\u2714 COMPLETED{_C.RESET}"
+    elif not progress.failed:
+        status = f"{_C.YELLOW}{_C.BOLD}! INCOMPLETE{_C.RESET}"
     else:
         status = f"{_C.RED}{_C.BOLD}\u2718 COMPLETED WITH ERRORS{_C.RESET}"
     line(f"    status    : {status}")
@@ -2440,13 +2581,33 @@ class StageManager:
         self.ada_cmd = ada_cmd
         self.tokenfile = tokenfile
         self.api = api
+        self.remote = remote_cfg.name if remote_cfg is not None else None
+        self.cancel_event = threading.Event()
+        self.deadline: float | None = None
+        self.remote_cfg = remote_cfg
         self.webdav_url = remote_cfg.get("url", fallback=None) if remote_cfg else None
         self.webdav_bearer_token = remote_cfg.get("bearer_token", fallback=None) if remote_cfg else None
         self.webdav_bearer_token_command = remote_cfg.get("bearer_token_command", fallback=None) if remote_cfg else None
         self._resolved_webdav_bearer_token = (self.webdav_bearer_token or "").strip() or None
+        self._request_urls: dict[str, str] = {}
+        self._pin_requests: dict[str, set[str]] = {}
+        self._pending_pins: set[str] = set()
 
-    def _base_cmd(self) -> list[str]:
-        return _ada_tokenfile_cmd(self.ada_cmd, self.tokenfile, self.api)
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def _command_timeout(self) -> float:
+        if self.deadline is None:
+            return DEFAULT_COMMAND_TIMEOUT
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("staging deadline exceeded")
+        return min(DEFAULT_COMMAND_TIMEOUT, remaining)
+
+    def _run_ada(self, arguments: list[str], *, check: bool = True, cleanup: bool = False):
+        return run_ada(self.ada_cmd, self.tokenfile, self.api, arguments, remote=self.remote,
+                       check=check, timeout=DEFAULT_COMMAND_TIMEOUT if cleanup else self._command_timeout(),
+                       cancel_event=None if cleanup else self.cancel_event)
 
     def can_prime_via_webdav_range(self) -> bool:
         return bool(self.webdav_url and (self._resolved_webdav_bearer_token or self.webdav_bearer_token_command))
@@ -2456,25 +2617,10 @@ class StageManager:
             return self._resolved_webdav_bearer_token
         if not self.webdav_bearer_token_command:
             return None
-        try:
-            cmd = shlex.split(self.webdav_bearer_token_command)
-            result = subprocess.run(
-                cmd,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except Exception as exc:
-            LOG.warning("could not obtain WebDAV bearer token from configured command: %s", exc)
+        if self.remote_cfg is None:
             return None
-        token = ""
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            if stripped:
-                token = stripped
-        self._resolved_webdav_bearer_token = token or None
-        return self._resolved_webdav_bearer_token
+        # Refresh command-backed tokens on each fallback request.
+        return _resolve_bearer_token(self.remote_cfg, timeout=self._command_timeout(), cancel_event=self.cancel_event)
 
     def _webdav_file_url(self, remote_path: str) -> str:
         if not self.webdav_url:
@@ -2489,6 +2635,12 @@ class StageManager:
         if not token:
             raise RuntimeError("no WebDAV bearer token available for staging fallback")
 
+        with tempfile.NamedTemporaryFile("w", suffix=".headers") as fh:
+            fh.write(f"Authorization: Bearer {token}\n")
+            fh.flush()
+            return self._prime_via_webdav_range(remote_path, fh.name)
+
+    def _prime_via_webdav_range(self, remote_path: str, header_file: str) -> dict:
         url = self._webdav_file_url(remote_path)
         cmd = [
             "curl",
@@ -2498,7 +2650,7 @@ class StageManager:
             "--max-time",
             str(DEFAULT_STAGE_FALLBACK_MAX_TIME),
             "--range",
-            "0-1",
+            "0-0",
             "--dump-header",
             "-",
             "--output",
@@ -2506,21 +2658,16 @@ class StageManager:
             "--write-out",
             "\n%{http_code}",
             "--header",
-            f"Authorization: Bearer {token}",
+            "@" + header_file,
             url,
         ]
-        redacted_cmd = cmd[:-2] + ["--header", "Authorization: Bearer <redacted>", url]
+        redacted_cmd = cmd
         redacted_cmd_text = shlex.join(redacted_cmd)
         LOG.debug("webdav stage fallback command: %s", redacted_cmd_text)
         attempt = 0
         while True:
-            result = subprocess.run(
-                cmd,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            result = run_command(cmd, check=False, timeout=min(self._command_timeout(), DEFAULT_STAGE_FALLBACK_MAX_TIME + 5),
+                                 cancel_event=self.cancel_event)
             stdout_text = result.stdout.rstrip()
             stdout_lines = stdout_text.splitlines() if stdout_text else []
             http_code_text = stdout_lines[-1].strip() if stdout_lines else "000"
@@ -2554,7 +2701,8 @@ class StageManager:
                     redacted_cmd_text,
                     detail_text or "(no curl details)",
                 )
-                time.sleep(wait)
+                if self.cancel_event.wait(min(wait, self._command_timeout())):
+                    raise TransferCancelled("staging cancelled")
                 attempt += 1
                 continue
 
@@ -2568,7 +2716,8 @@ class StageManager:
                     redacted_cmd_text,
                     detail_text or "(no curl details)",
                 )
-                time.sleep(wait)
+                if self.cancel_event.wait(min(wait, self._command_timeout())):
+                    raise TransferCancelled("staging cancelled")
                 attempt += 1
                 continue
 
@@ -2581,7 +2730,8 @@ class StageManager:
                     redacted_cmd_text,
                     detail_text or "(no curl details)",
                 )
-                time.sleep(wait)
+                if self.cancel_event.wait(min(wait, self._command_timeout())):
+                    raise TransferCancelled("staging cancelled")
                 attempt += 1
                 continue
 
@@ -2611,37 +2761,117 @@ class StageManager:
                 fh.write("/" + p.strip("/") + "\n")
             list_file = fh.name
         try:
-            cmd = self._base_cmd() + ["--stage", "--from-file", list_file, "--lifetime", lifetime]
-            LOG.debug("stage command: %s", shlex.join(cmd))
-            result = run_command(cmd)
-            request_ids = _extract_ada_request_ids((result.stdout or "") + "\n" + (result.stderr or ""))
+            result = self._run_ada(["--stage", "--from-file", list_file, "--lifetime", lifetime])
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            # ADA also prints targets, whose filenames can contain UUIDs.
+            # Only UUIDs in returned bulk URLs identify requests we own.
+            request_ids = self._remember_request_urls(output)
             if request_ids:
                 LOG.info("stage request id(s): %s", ", ".join(request_ids))
             else:
-                LOG.debug("no stage request id found in ada output")
+                raise RuntimeError("ADA accepted staging without a request id; cannot track its pins")
+            paths = {"/" + p.strip("/") for p in remote_paths}
+            for request_id in request_ids:
+                self._pin_requests[request_id] = paths.copy()
+            self._pending_pins.update(paths)
             return request_ids
         finally:
             os.unlink(list_file)
 
     def unstage(self, remote_paths: list[str]):
-        """Release pins via ``ada --unstage --from-file``."""
-        if not remote_paths:
+        """Release only this manager's pins and wait for asynchronous completion."""
+        requested = {"/" + p.strip("/") for p in remote_paths}
+        if not requested:
             return
-        with named_tempfile("w", suffix=".txt", delete=False) as fh:
-            for p in remote_paths:
-                fh.write("/" + p.strip("/") + "\n")
-            list_file = fh.name
+        # A queued PIN can create a pin after an early UNPIN. Settle or cancel
+        # the owned PIN request first, then release pins using that request id.
+        old_deadline = self.deadline
+        self.deadline = time.monotonic() + DEFAULT_COMMAND_TIMEOUT
         try:
-            cmd = self._base_cmd() + ["--unstage", "--from-file", list_file]
-            LOG.debug("unstage command: %s", shlex.join(cmd))
-            run_command(cmd)
+            for request_id, paths in list(self._pin_requests.items()):
+                release_paths = requested.intersection(paths)
+                if not release_paths:
+                    continue
+                url = self._request_urls.get(request_id)
+                if not url:
+                    raise RuntimeError(f"no API URL for owned stage request {request_id}; refusing to release unrelated pins")
+                if release_paths.intersection(self._pending_pins):
+                    self._api_request(url, method="PATCH", data={"action": "cancel"}, cleanup=True)
+                self._wait_request_terminal(request_id, cleanup=True, allow_cancelled=True)
+                output = self._api_request(url.rsplit("/", 1)[0], method="POST", cleanup=True,
+                                           data={"activity": "UNPIN", "arguments": {"id": request_id},
+                                                 "target": sorted(release_paths), "expand_directories": "NONE"})
+                release_ids = self._remember_request_urls(output)
+                if not release_ids:
+                    raise RuntimeError("UNPIN accepted without a request URL; pin release is unconfirmed")
+                for release_id in release_ids:
+                    self._wait_request_terminal(release_id, cleanup=True, expected_paths=release_paths)
+                paths.difference_update(release_paths)
+                self._pending_pins.difference_update(release_paths)
+                if not paths:
+                    del self._pin_requests[request_id]
+                LOG.info("released %d pin(s) from stage request %s", len(release_paths), request_id)
         finally:
-            os.unlink(list_file)
+            self.deadline = old_deadline
+
+    def _remember_request_urls(self, output: str) -> list[str]:
+        ids = []
+        for url in re.findall(r"https?://[^\s\"'<>]+/bulk-requests/[0-9a-fA-F-]{36}", output):
+            request_id = url.rsplit("/", 1)[-1]
+            self._request_urls[request_id] = url
+            if request_id not in ids:
+                ids.append(request_id)
+        return ids
+
+    def _api_request(self, url: str, *, method: str = "GET", data: dict | None = None,
+                     cleanup: bool = False) -> str:
+        """Use returned bulk URLs even with ADA versions lacking --stat-request."""
+        timeout = self._command_timeout()
+        cancel_event = None if cleanup else self.cancel_event
+        with _ada_tokenfile(self.tokenfile, self.remote, timeout=timeout, cancel_event=cancel_event) as (_, token):
+            with tempfile.NamedTemporaryFile("w", suffix=".headers") as headers, \
+                    tempfile.NamedTemporaryFile("w", suffix=".json") as body:
+                headers.write(f"Authorization: Bearer {token}\nContent-Type: application/json\n")
+                headers.flush()
+                cmd = ["curl", "--silent", "--show-error", "--fail", "--connect-timeout", "10",
+                       "--max-time", str(self._command_timeout()), "--header", "@" + headers.name,
+                       "--request", method]
+                if data is not None:
+                    json.dump(data, body)
+                    body.flush()
+                    cmd += ["--data-binary", "@" + body.name]
+                if method == "POST":
+                    cmd += ["--dump-header", "-"]
+                result = run_command(cmd + [url], timeout=self._command_timeout(), cancel_event=cancel_event,
+                                     secrets=(token,))
+                return result.stdout
+
+    def _wait_request_terminal(self, request_id: str, *, cleanup: bool = False,
+                               allow_cancelled: bool = False, expected_paths: set[str] | None = None) -> None:
+        while True:
+            data, error = self._stat_request_json(request_id, cleanup=cleanup)
+            if error or not isinstance(data, dict):
+                raise RuntimeError(error or f"invalid status for bulk request {request_id}")
+            status = str(data.get("status", "")).upper()
+            if status in {"COMPLETED", "CANCELLED", "FAILED"}:
+                if allow_cancelled:
+                    return  # Failed PIN targets are handled by the pipeline/fallback.
+                failed = [t for t in data.get("targets", []) if t.get("state", "").upper() != "COMPLETED"]
+                if status != "COMPLETED" or failed:
+                    raise RuntimeError(f"bulk request {request_id} failed: {status}; targets: {failed}")
+                confirmed = {"/" + t.get("target", "").strip("/") for t in data.get("targets", [])}
+                if expected_paths and not expected_paths.issubset(confirmed):
+                    raise RuntimeError(f"bulk request {request_id} omitted targets; pin release is unconfirmed")
+                return
+            wait = min(1, self._command_timeout())
+            if cleanup:
+                time.sleep(wait)
+            elif self.cancel_event.wait(wait):
+                raise TransferCancelled("staging cancelled")
 
     def _stat_json(self, remote_path: str) -> tuple[dict | None, str | None]:
         """Return parsed ``ada --stat`` JSON for a path, or an error string."""
-        cmd = self._base_cmd() + ["--stat", "/" + remote_path.strip("/")]
-        result = run_command(cmd, check=False)
+        result = self._run_ada(["--stat", "/" + remote_path.strip("/")], check=False)
         if result.returncode != 0:
             detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
             summary = detail[0] if detail else f"exit {result.returncode}"
@@ -2652,9 +2882,34 @@ class StageManager:
             preview = result.stdout.strip()[:200]
             return None, f"ada --stat returned invalid JSON for {remote_path}: {preview!r}"
 
-    def _stat_request_json(self, request_id: str) -> tuple[dict | None, str | None]:
-        cmd = self._base_cmd() + ["--stat-request", request_id]
-        result = run_command(cmd, check=False)
+    def _stat_request_json(self, request_id: str, *, cleanup: bool = False) -> tuple[dict | None, str | None]:
+        url = self._request_urls.get(request_id)
+        if url:
+            # Target results are paginated. Later pages can contain failed pins.
+            try:
+                data = json.loads(self._api_request(url, cleanup=cleanup))
+                if not isinstance(data, dict) or data.get("uid") != request_id:
+                    raise ValueError("bulk response does not identify the requested job")
+                targets = list(data.get("targets", []))
+                offset = data.get("nextId", -1)
+                seen = set()
+                while offset is not None and int(offset) >= 0:
+                    if offset in seen:
+                        raise ValueError("repeated bulk target pagination offset")
+                    seen.add(offset)
+                    page = json.loads(self._api_request(url + "?offset=" + str(int(offset)), cleanup=cleanup))
+                    if not isinstance(page, dict) or page.get("uid") != request_id:
+                        raise ValueError("bulk target page does not identify the requested job")
+                    targets.extend(page.get("targets", []))
+                    offset = page.get("nextId", -1)
+                data["targets"] = targets
+                if any(not isinstance(t, dict) or not isinstance(t.get("state"), str)
+                       or not isinstance(t.get("target"), str) for t in targets):
+                    raise ValueError("invalid bulk target status")
+                return data, None
+            except (ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+                return None, f"could not inspect bulk request {request_id}: {exc}"
+        result = self._run_ada(["--stat-request", request_id], check=False)
         if result.returncode != 0:
             detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
             summary = detail[0] if detail else f"exit {result.returncode}"
@@ -2679,6 +2934,9 @@ class StageManager:
             return False
         locality = data.get("fileLocality", "")
         return "ONLINE" in str(locality).upper()
+
+    def _download_ready(self, remote_path: str, data: dict | None) -> bool:
+        return self._payload_is_online(data) and "/" + remote_path.strip("/") not in self._pending_pins
 
     def poll_online_statuses(self, remote_paths: list[str]) -> tuple[list[str], dict[str, str]]:
         """Poll many paths efficiently by grouping ``ada --stat`` calls per parent directory."""
@@ -2713,10 +2971,10 @@ class StageManager:
                             fallback_data, fallback_error = self._stat_json(cleaned_path)
                             if fallback_error:
                                 errors[original_path] = fallback_error
-                            elif self._payload_is_online(fallback_data):
+                            elif self._download_ready(original_path, fallback_data):
                                 online.append(original_path)
                             continue
-                        if self._payload_is_online(child):
+                        if self._download_ready(original_path, child):
                             online.append(original_path)
 
             if used_directory_children:
@@ -2730,7 +2988,7 @@ class StageManager:
                     else:
                         errors[original_path] = fallback_error
                     continue
-                if self._payload_is_online(fallback_data):
+                if self._download_ready(original_path, fallback_data):
                     online.append(original_path)
 
         return online, errors
@@ -2769,6 +3027,8 @@ class StageManager:
                 if normalized_target not in normalized_relevant:
                     continue
                 state = str(target.get("state", ""))
+                if state.upper() in {"COMPLETED", "FAILED", "CANCELLED"}:
+                    self._pending_pins.discard(normalized_target)
                 if state.upper() in {"FAILED", "CANCELLED"}:
                     error_message = str(target.get("errorMessage") or target.get("errorType") or request_status or "stage request failed")
                     failures[normalized_target] = f"stage request {request_id} {state.lower()}: {error_message}"
@@ -2785,6 +3045,7 @@ class StageManager:
         pending = set(remote_paths)
         online_order: list[str] = []
         start = time.monotonic()
+        self.deadline = start + timeout
         is_tty = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
 
         while pending:
@@ -2795,6 +3056,9 @@ class StageManager:
                     f"{len(pending)}/{len(remote_paths)} files still not online"
                 )
 
+            failures = self.poll_stage_request_errors(list(self._pin_requests), pending)
+            if failures:
+                raise RuntimeError("staging failed: " + "; ".join(failures.values()))
             newly_online, _ = self.poll_online_statuses(list(pending))
 
             for p in newly_online:
@@ -2822,11 +3086,13 @@ class StageManager:
                     "staging: %d/%d online, %d pending, elapsed %s",
                     done, total, len(pending), fmt_duration(elapsed),
                 )
-                time.sleep(poll_interval)
+                if self.cancel_event.wait(min(poll_interval, self._command_timeout())):
+                    raise TransferCancelled("staging cancelled")
 
         if is_tty:
             sys.stderr.write("\r\033[K")
             sys.stderr.flush()
+        self.deadline = None
         LOG.info("all %d file(s) are ONLINE", len(remote_paths))
         return online_order
 
@@ -2840,15 +3106,21 @@ class StageManager:
         """Wait until at least one path from remote_paths (not in already_online) is ONLINE.
         Returns the first path found online."""
         start = time.monotonic()
+        self.deadline = start + timeout
         candidates = [p for p in remote_paths if p not in already_online]
         while True:
             elapsed = time.monotonic() - start
             if elapsed > timeout:
                 raise TimeoutError(f"staging timed out after {fmt_duration(elapsed)}")
+            failures = self.poll_stage_request_errors(list(self._pin_requests), set(candidates))
+            if failures:
+                raise RuntimeError("staging failed: " + "; ".join(failures.values()))
             online, _ = self.poll_online_statuses(candidates)
             if online:
+                self.deadline = None
                 return online[0]
-            time.sleep(poll_interval)
+            if self.cancel_event.wait(min(poll_interval, self._command_timeout())):
+                raise TransferCancelled("staging cancelled")
 
 
 # ---------------------------------------------------------------------------
@@ -2879,6 +3151,7 @@ class Transferer:
         self.checksum_timeout = checksum_timeout
         self.skip_verified = skip_verified
         self.delete_source = delete_source
+        self.cancel_event = threading.Event()
         self.progress: Progress | None = None  # set by caller to enable status updates
         self._seen_dirs: set[str] = set()
         self._dirs_lock = threading.Lock()
@@ -2909,7 +3182,7 @@ class Transferer:
         if display_name:
             self._set_progress_status(f"hashing {display_name}")
         try:
-            return adler32_local(local_path)
+            return adler32_local(local_path, use_cache=not self.delete_source, cancel_event=self.cancel_event)
         finally:
             if display_name:
                 self._set_progress_status("")
@@ -2982,133 +3255,143 @@ class Transferer:
 
     # -- upload (local → dCache) -------------------------------------------
 
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise TransferCancelled("transfer cancelled")
+
+    @staticmethod
+    def _upload_snapshot(entry: dict) -> tuple:
+        return (_file_fingerprint(Path(entry["source"]).lstat()),
+                _file_fingerprint(Path(entry["resolved_source"]).stat()))
+
+    def _assert_upload_unchanged(self, entry: dict, snapshot: tuple) -> None:
+        self._check_cancelled()
+        if self._upload_snapshot(entry) != snapshot:
+            raise SourceChangedError(f"source changed during transfer; retained: {entry['source']}")
+
     def upload(self, entry: dict) -> dict:
         local_path = Path(entry["resolved_source"])
         rel = entry["rel"].replace(os.sep, "/")
         remote_path = str(entry["remote_path"]).strip("/")
         if not remote_path:
             raise ValueError("remote path could not be derived")
-        remote_dir = posixpath.dirname(remote_path)
-
-        # Skip-verification: check remote first (cheap API call).
-        # Only hash locally if the remote already has a checksum — avoids
-        # reading the entire file before uploading it on a cold run.
-        local_adler: str | None = None
+        entry = dict(entry, source=entry.get("source", local_path))
+        snapshot = self._upload_snapshot(entry)
+        local_adler = adler32_local(local_path, use_cache=not self.delete_source, cancel_event=self.cancel_event)
+        self._assert_upload_unchanged(entry, snapshot)
         if self.skip_verified:
             try:
-                local_adler, remote_adler = self._read_verified_adlers(
-                    local_path,
-                    remote_path,
-                    display_name=local_path.name,
-                )
-                if self._adlers_match(local_adler, remote_adler):
-                    self._delete_uploaded_source(entry)
-                    LOG.debug("skip %s (verified)", rel)
-                    return self._result(rel, remote_path, entry, local_adler, remote_adler, 0, True)
-            except FileNotFoundError:
-                LOG.debug("remote file missing for %s; uploading", rel)
-            except Exception:
-                LOG.debug("remote checksum unavailable for %s; uploading", rel)
+                remote_adler = self._remote_adler(remote_path)
+            except (RuntimeError, FileNotFoundError, subprocess.SubprocessError):
+                self._check_cancelled()
+                remote_adler = None
+            if remote_adler and normalize_adler(local_adler) == normalize_adler(remote_adler):
+                self._delete_uploaded_source(entry, snapshot, local_adler)
+                return self._result(rel, remote_path, entry, local_adler, remote_adler, 0, True)
 
+        last_error = None
         for attempt in range(self.max_retries + 1):
-            self._rclone_mkdir(remote_dir)
-            self._rclone_copyto(str(local_path), f"{self.remote}:{remote_path}")
-            # Fetch remote checksum (may wait for dCache to compute it).
-            # Compute local hash concurrently in a thread so we don't add
-            # extra wall-clock time on top of the checksum wait.
+            self._assert_upload_unchanged(entry, snapshot)
+            remote_dir = posixpath.dirname(remote_path)
+            temporary = posixpath.join(remote_dir, f".dcache-cp-{uuid.uuid4().hex}.part")
+            preserve_temporary = False
+            promoted = False
             try:
-                local_adler, remote_adler = self._read_verified_adlers(
-                    local_path,
-                    remote_path,
-                    display_name=local_path.name,
-                    local_adler=local_adler,
-                    overlap_local_hash=(local_adler is None),
-                )
-            except Exception as exc:
-                LOG.warning("verification failed %s: %s (attempt %d/%d)",
-                            rel, exc, attempt + 1, self.max_retries + 1)
-                try:
-                    self._rclone_deletefile(f"{self.remote}:{remote_path}")
-                except Exception as delete_exc:
-                    LOG.debug("cleanup after verification failure for %s failed: %s", rel, delete_exc)
-                local_adler = None
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_wait)
-                    continue
-                raise RuntimeError(f"verification failed for {rel}: {exc}") from exc
-
-            if self._adlers_match(local_adler, remote_adler):
-                self._delete_uploaded_source(entry)
+                self._rclone_mkdir(remote_dir)
+                self._rclone_copyto(str(local_path), f"{self.remote}:{temporary}")
+                remote_adler = self._remote_adler(temporary)
+                self._assert_upload_unchanged(entry, snapshot)
+                if normalize_adler(adler32_local(local_path, use_cache=False, cancel_event=self.cancel_event)) != normalize_adler(local_adler):
+                    raise SourceChangedError(f"source content changed during transfer; retained: {local_path}")
+                if normalize_adler(local_adler) != normalize_adler(remote_adler):
+                    raise RuntimeError(f"checksum mismatch for {rel}: local={local_adler} remote={remote_adler}")
+                # Once promotion starts, retain any remaining verified temporary
+                # copy on failure so it can be recovered even if MOVE was partial.
+                preserve_temporary = True
+                self._rclone_moveto(f"{self.remote}:{temporary}", f"{self.remote}:{remote_path}")
+                promoted = True
+                remote_adler = self._remote_adler(remote_path)
+                if normalize_adler(local_adler) != normalize_adler(remote_adler):
+                    raise RuntimeError(f"checksum mismatch after promotion for {rel}; source retained")
+                self._delete_uploaded_source(entry, snapshot, local_adler)
                 return self._result(rel, remote_path, entry, local_adler, remote_adler, attempt + 1, False)
-            LOG.warning("checksum mismatch %s: local=%s remote=%s (attempt %d/%d)",
-                        rel, local_adler, remote_adler, attempt + 1, self.max_retries + 1)
-            self._rclone_deletefile(f"{self.remote}:{remote_path}")
-            local_adler = None  # re-hash on retry in case file changed
-            if attempt < self.max_retries:
-                time.sleep(self.retry_wait)
-
-        raise RuntimeError(f"checksum mismatch for {rel}: local={local_adler} remote={remote_adler}")
+            except (SourceChangedError, TransferCancelled):
+                raise
+            except Exception as exc:
+                last_error = exc
+                if preserve_temporary:
+                    raise RuntimeError(f"promotion/verification failed for {rel}; source retained; "
+                                       f"check {self.remote}:{temporary} and {self.remote}:{remote_path}: {exc}") from exc
+                LOG.warning("transfer failed %s: %s (attempt %d/%d)", rel, exc, attempt + 1, self.max_retries + 1)
+            finally:
+                if not preserve_temporary and not promoted:
+                    try:
+                        self._rclone_deletefile(f"{self.remote}:{temporary}")
+                    except Exception as exc:
+                        LOG.debug("temporary upload cleanup failed for %s: %s", temporary, exc)
+            if attempt < self.max_retries and self.cancel_event.wait(self.retry_wait):
+                raise TransferCancelled("transfer cancelled")
+        raise RuntimeError(f"upload failed for {rel}: {last_error}") from last_error
 
     # -- download (dCache → local) -----------------------------------------
 
     def download(self, entry: dict) -> dict:
+        self._check_cancelled()
         remote_path = str(entry["remote_path"]).strip("/")
         local_path = Path(entry["local_path"])
-        rel = entry["rel"]
-        size = entry.get("size", 0)
-
-        if self.skip_verified and local_path.exists():
+        rel, size = entry["rel"], entry.get("size", 0)
+        if self.skip_verified and local_path.is_file():
+            snapshot = _file_fingerprint(local_path.stat())
             try:
-                local_adler, remote_adler = self._read_verified_adlers(
-                    local_path,
-                    remote_path,
-                    display_name=local_path.name,
-                )
-                if self._adlers_match(local_adler, remote_adler):
-                    self._delete_downloaded_source(remote_path)
-                    LOG.debug("skip %s (verified)", rel)
+                remote_adler = self._remote_adler(remote_path)
+                local_adler = adler32_local(local_path, use_cache=not self.delete_source, cancel_event=self.cancel_event)
+            except (RuntimeError, FileNotFoundError, subprocess.SubprocessError):
+                self._check_cancelled()
+            else:
+                if normalize_adler(local_adler) == normalize_adler(remote_adler):
+                    self._delete_downloaded_source(remote_path, local_path, local_adler, snapshot)
                     return self._dl_result(rel, remote_path, local_path, size, local_adler, remote_adler, 0, True)
-            except Exception:
-                LOG.debug("checksum comparison failed for %s; downloading", rel)
 
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        destination_snapshot = _file_fingerprint(local_path.lstat()) if local_path.exists() else None
+        last_error = None
         for attempt in range(self.max_retries + 1):
-            temp_local_path = self._create_download_temp_path(local_path)
+            temporary = local_path.with_name(f".dcache-cp-{uuid.uuid4().hex}.part")
+            promoted = False
             try:
-                self._rclone_copyto(f"{self.remote}:{remote_path}", str(temp_local_path))
-                local_adler, remote_adler = self._read_verified_adlers(
-                    temp_local_path,
-                    remote_path,
-                    display_name=local_path.name,
-                )
-            except Exception as exc:
-                LOG.warning("verification failed %s: %s (attempt %d/%d)",
-                            rel, exc, attempt + 1, self.max_retries + 1)
-                temp_local_path.unlink(missing_ok=True)
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_wait)
-                    continue
-                raise RuntimeError(f"verification failed for {rel}: {exc}") from exc
-
-            if self._adlers_match(local_adler, remote_adler):
-                try:
-                    self._install_verified_download(temp_local_path, local_path)
-                except Exception as exc:
-                    LOG.warning("download finalization failed %s: %s (attempt %d/%d)",
-                                rel, exc, attempt + 1, self.max_retries + 1)
-                    temp_local_path.unlink(missing_ok=True)
-                    if attempt < self.max_retries:
-                        time.sleep(self.retry_wait)
-                        continue
-                    raise RuntimeError(f"download finalization failed for {rel}: {exc}") from exc
-                self._delete_downloaded_source(remote_path)
+                self._rclone_copyto(f"{self.remote}:{remote_path}", str(temporary))
+                remote_adler = self._remote_adler(remote_path)
+                local_adler = adler32_local(temporary, use_cache=False, cancel_event=self.cancel_event)
+                if normalize_adler(local_adler) != normalize_adler(remote_adler):
+                    raise RuntimeError(f"checksum mismatch for {rel}: local={local_adler} remote={remote_adler}")
+                self._check_cancelled()
+                current = _file_fingerprint(local_path.lstat()) if local_path.exists() else None
+                if current != destination_snapshot:
+                    raise SourceChangedError(f"destination changed during transfer; retained: {local_path}")
+                if current is not None:
+                    temporary.chmod(local_path.stat().st_mode & 0o777)
+                temporary.replace(local_path)
+                promoted = True
+                snapshot = _file_fingerprint(local_path.stat())
+                self._delete_downloaded_source(remote_path, local_path, local_adler, snapshot)
                 return self._dl_result(rel, remote_path, local_path, size, local_adler, remote_adler, attempt + 1, False)
-            LOG.warning("checksum mismatch %s: local=%s remote=%s (attempt %d/%d)",
-                        rel, local_adler, remote_adler, attempt + 1, self.max_retries + 1)
-            temp_local_path.unlink(missing_ok=True)
-            if attempt < self.max_retries:
-                time.sleep(self.retry_wait)
-
-        raise RuntimeError(f"checksum mismatch for {rel}: local={local_adler} remote={remote_adler}")
+            except (SourceChangedError, TransferCancelled):
+                raise
+            except Exception as exc:
+                last_error = exc
+                # A verified copy already promoted to the destination must survive
+                # a failure to delete/recheck the remote source.
+                if promoted:
+                    raise
+                LOG.warning("transfer failed %s: %s (attempt %d/%d)", rel, exc, attempt + 1, self.max_retries + 1)
+            finally:
+                temporary.unlink(missing_ok=True)
+            if attempt < self.max_retries and self.cancel_event.wait(self.retry_wait):
+                raise TransferCancelled("transfer cancelled")
+        raise RuntimeError(f"download failed for {rel}: {last_error}") from last_error
 
     def _extract_bundle_members(
         self,
@@ -3194,6 +3477,7 @@ class Transferer:
                 [
                     unsquashfs,
                     "-no-progress",
+                    "-no-xattrs",
                     "-dest",
                     str(extraction_root),
                     str(bundle_path),
@@ -3236,11 +3520,17 @@ class Transferer:
         return staged_members
 
     def download_bundle(self, entry: dict) -> dict:
+        self._check_cancelled()
         bundle_remote_path = str(entry["remote_path"]).strip("/")
         bundle_members = _bundle_members_for_entry(entry)
         if not bundle_members:
             raise ValueError(f"bundle download entry has no members: {bundle_remote_path}")
         bundle_format = str(entry.get("bundle_format", DEFAULT_BUNDLE_FORMAT))
+        snapshots = {
+            Path(member["local_path"]): _file_fingerprint(Path(member["local_path"]).lstat())
+            if Path(member["local_path"]).exists() else None
+            for member in bundle_members
+        }
 
         if self.skip_verified and _bundle_entry_fully_verified(entry):
             LOG.debug("skip bundle %s (all requested members already verified)", bundle_remote_path)
@@ -3253,14 +3543,10 @@ class Transferer:
             }
 
         if self._should_try_sparse_bundle_read(entry, bundle_members, bundle_format):
+            staged_members = []
             try:
                 staged_members = self._extract_squashfs_bundle_members_via_mount(bundle_remote_path, bundle_members)
-                for temp_local_path, local_path, member in staged_members:
-                    self._install_verified_download(temp_local_path, local_path)
-                    try:
-                        os.chmod(local_path, int(member["mode"]))
-                    except OSError:
-                        LOG.debug("could not restore mode for %s", local_path)
+                self._install_bundle_members(staged_members, snapshots)
                 return {
                     "rel": entry["rel"],
                     "remote_path": bundle_remote_path,
@@ -3270,6 +3556,10 @@ class Transferer:
                     "sparse": True,
                 }
             except Exception as exc:
+                for temp_local_path, _local_path, _member in staged_members:
+                    temp_local_path.unlink(missing_ok=True)
+                if isinstance(exc, (SourceChangedError, TransferCancelled)):
+                    raise
                 LOG.info("bundle sparse read fallback for %s: %s", bundle_remote_path, exc)
 
         bundle_name = posixpath.basename(bundle_remote_path) or "bundle"
@@ -3296,12 +3586,7 @@ class Transferer:
                     bundle_members,
                     bundle_format=bundle_format,
                 )
-                for temp_local_path, local_path, member in staged_members:
-                    self._install_verified_download(temp_local_path, local_path)
-                    try:
-                        os.chmod(local_path, int(member["mode"]))
-                    except OSError:
-                        LOG.debug("could not restore mode for %s", local_path)
+                self._install_bundle_members(staged_members, snapshots)
             except Exception as exc:
                 LOG.warning(
                     "bundle download failed %s: %s (attempt %d/%d)",
@@ -3313,8 +3598,11 @@ class Transferer:
                 temp_bundle_path.unlink(missing_ok=True)
                 for temp_local_path, _local_path, _member in staged_members:
                     temp_local_path.unlink(missing_ok=True)
+                if isinstance(exc, (SourceChangedError, TransferCancelled)):
+                    raise
                 if attempt < self.max_retries:
-                    time.sleep(self.retry_wait)
+                    if self.cancel_event.wait(self.retry_wait):
+                        raise TransferCancelled("transfer cancelled")
                     continue
                 raise RuntimeError(f"bundle download failed for {bundle_remote_path}: {exc}") from exc
 
@@ -3330,6 +3618,20 @@ class Transferer:
             }
 
         raise RuntimeError(f"bundle download failed for {bundle_remote_path}")
+
+    def _install_bundle_members(self, staged_members, snapshots) -> None:
+        self._check_cancelled()
+        for _temporary, local_path, _member in staged_members:
+            current = _file_fingerprint(local_path.lstat()) if local_path.exists() else None
+            if current != snapshots[local_path]:
+                raise SourceChangedError(f"destination changed during transfer; retained: {local_path}")
+        for temporary, local_path, member in staged_members:
+            self._check_cancelled()
+            self._install_verified_download(temporary, local_path)
+            try:
+                os.chmod(local_path, int(member["mode"]))
+            except OSError:
+                LOG.debug("could not restore mode for %s", local_path)
 
     # -- shared helpers ----------------------------------------------------
 
@@ -3356,12 +3658,18 @@ class Transferer:
           backoff grows to 5 min then stays there
         Any other non-zero exit raises immediately.
         """
-        cmd = _ada_tokenfile_cmd(self.ada_cmd, self.rclone_config, self.api) + ["--checksum", "/" + remote_path.strip("/")]
-
         deadline = time.monotonic() + self.checksum_timeout
         attempt = 0
         while True:
-            result = run_command(cmd, check=False)
+            self._check_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"checksum deadline exceeded for {remote_path}")
+            result = run_ada(self.ada_cmd, self.rclone_config, self.api,
+                             ["--checksum", "/" + remote_path.strip("/")], remote=self.remote,
+                             check=False, timeout=min(DEFAULT_COMMAND_TIMEOUT, remaining), cancel_event=self.cancel_event)
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"checksum deadline exceeded for {remote_path}")
             output = result.stdout + result.stderr
 
             if _ada_reports_missing_path(output):
@@ -3372,7 +3680,8 @@ class Transferer:
                     wait = min(2 ** attempt * 2, 60)  # 2 s … 60 s
                     if time.monotonic() + wait < deadline:
                         LOG.debug("ada rate-limited (429) for %s, retrying in %ds", remote_path, wait)
-                        time.sleep(wait)
+                        if self.cancel_event.wait(wait):
+                            raise TransferCancelled("transfer cancelled")
                         attempt += 1
                         continue
                 if _ada_reports_transient_transport_error(output):
@@ -3383,11 +3692,13 @@ class Transferer:
                             remote_path,
                             wait,
                         )
-                        time.sleep(wait)
+                        if self.cancel_event.wait(wait):
+                            raise TransferCancelled("transfer cancelled")
                         attempt += 1
                         continue
                 # Non-429, or deadline would be exceeded waiting for 429 retry.
-                detail = (result.stdout.strip() or result.stderr.strip()).splitlines()[0]
+                details = (result.stdout.strip() or result.stderr.strip()).splitlines()
+                detail = details[0] if details else f"exit {result.returncode}"
                 LOG.debug("ada --checksum failed for %s (exit %d): %s",
                           remote_path, result.returncode, detail)
                 raise RuntimeError(f"ada checksum unavailable for {remote_path}")
@@ -3406,7 +3717,8 @@ class Transferer:
                 )
             LOG.debug("checksum not yet available for %s, retrying in %ds (elapsed %.0fs/%.0fs)",
                       remote_path, wait, elapsed, self.checksum_timeout)
-            time.sleep(wait)
+            if self.cancel_event.wait(wait):
+                raise TransferCancelled("transfer cancelled")
             attempt += 1
 
     def _rclone_mkdir(self, remote_dir: str):
@@ -3415,28 +3727,46 @@ class Transferer:
         with self._dirs_lock:
             if remote_dir in self._seen_dirs:
                 return
+            run_command(["rclone", "--config", str(self.rclone_config), "mkdir", f"{self.remote}:{remote_dir}"],
+                        cancel_event=self.cancel_event)
             self._seen_dirs.add(remote_dir)
-        run_command(["rclone", "--config", str(self.rclone_config), "mkdir", f"{self.remote}:{remote_dir}"])
 
     def _rclone_copyto(self, src: str, dst: str):
-        run_command([
-            "rclone", "--config", str(self.rclone_config),
-            "-v", "--timeout", self.copy_timeout,
-            "copyto", src, dst,
-        ])
+        run_command(["rclone", "--config", str(self.rclone_config), "-v", "--timeout", self.copy_timeout,
+                     "--ignore-times", "copyto", src, dst], timeout=None, cancel_event=self.cancel_event)
+
+    def _rclone_moveto(self, src: str, dst: str):
+        # Let WebDAV's MOVE Overwrite:T replace the target. With a checked
+        # destination, rclone deletes it before attempting the server-side MOVE.
+        run_command(["rclone", "--config", str(self.rclone_config), "-v", "--timeout", self.copy_timeout,
+                     "--ignore-times", "--no-check-dest", "moveto", src, dst], timeout=None, cancel_event=self.cancel_event)
 
     def _rclone_deletefile(self, target: str):
-        run_command(["rclone", "--config", str(self.rclone_config), "-v", "deletefile", target])
+        run_command(["rclone", "--config", str(self.rclone_config), "-v", "deletefile", target],
+                    cancel_event=self.cancel_event)
 
-    def _delete_uploaded_source(self, entry: dict) -> None:
+    def _delete_uploaded_source(self, entry: dict, snapshot: tuple, checksum: str) -> None:
+        self._assert_upload_unchanged(entry, snapshot)
+        if normalize_adler(adler32_local(Path(entry["resolved_source"]), use_cache=False, cancel_event=self.cancel_event)) != normalize_adler(checksum):
+            raise SourceChangedError(f"source changed; retained: {entry['source']}")
+        self._assert_upload_unchanged(entry, snapshot)
+        if self.delete_source:
+            Path(entry["source"]).unlink()
+
+    def _delete_downloaded_source(self, remote_path: str, local_path: Path, checksum: str, snapshot: tuple) -> None:
+        self._check_cancelled()
+        if _file_fingerprint(local_path.stat()) != snapshot:
+            raise SourceChangedError(f"local copy changed; remote source retained: {remote_path}")
         if not self.delete_source:
             return
-        source_path = Path(entry.get("source", entry["resolved_source"]))
-        source_path.unlink()
-
-    def _delete_downloaded_source(self, remote_path: str) -> None:
-        if not self.delete_source:
-            return
+        self._check_cancelled()
+        if normalize_adler(self._remote_adler(remote_path)) != normalize_adler(checksum):
+            raise SourceChangedError(f"remote source changed; retained: {remote_path}")
+        if normalize_adler(adler32_local(local_path, use_cache=False, cancel_event=self.cancel_event)) != normalize_adler(checksum):
+            raise SourceChangedError(f"local copy changed; remote source retained: {remote_path}")
+        if _file_fingerprint(local_path.stat()) != snapshot:
+            raise SourceChangedError(f"local copy changed; remote source retained: {remote_path}")
+        self._check_cancelled()
         self._rclone_deletefile(f"{self.remote}:{remote_path}")
 
 
@@ -3473,7 +3803,7 @@ def _execute_simple(
                 continue
             remaining -= 1
             _handle_worker_result(entry, exc, result, progress, bar, result_handler=result_handler)
-    except KeyboardInterrupt:
+    except BaseException:
         pool.stop()
         raise
     finally:
@@ -3970,9 +4300,10 @@ def _filter_verified_download_entries(
         remote_path = str(entry["remote_path"]).strip("/")
         try:
             remote_adler = transferer._remote_adler(remote_path)
-            local_adler = adler32_local(local_path)
+            snapshot = _file_fingerprint(local_path.stat())
+            local_adler = adler32_local(local_path, use_cache=not transferer.delete_source)
             if normalize_adler(local_adler) == normalize_adler(remote_adler):
-                transferer._delete_downloaded_source(remote_path)
+                transferer._delete_downloaded_source(remote_path, local_path, local_adler, snapshot)
                 LOG.debug("skip %s (verified before staging)", entry["rel"])
                 skipped.append(entry)
                 continue
@@ -4002,6 +4333,8 @@ def _build_stage_batches(files: list[dict], max_files: int, max_bytes: int) -> l
 
     for entry in files:
         entry_size = _entry_stage_bytes(entry)
+        if entry_size > max_bytes:
+            raise ValueError(f"file {entry['remote_path']} exceeds --stage-batch-bytes; increase the limit")
         if current and (len(current) >= max_files or current_bytes + entry_size > max_bytes):
             batches.append(current)
             current = []
@@ -4043,13 +4376,12 @@ def _destage_paths(
     failures: list[str] = []
     if bar is not None:
         bar.finish()
-    for remote_path in remote_paths:
-        try:
-            stage_mgr.unstage([remote_path])
-            LOG.debug("destaged %s from batch %d", remote_path, batch_num)
-        except Exception as exc:
-            LOG.warning("destage failed for %s (batch %d): %s", remote_path, batch_num, exc)
-            failures.append(remote_path)
+    try:
+        stage_mgr.unstage(remote_paths)
+        LOG.debug("destaged %d path(s) from batch %d", len(remote_paths), batch_num)
+    except Exception as exc:
+        LOG.warning("destage failed for batch %d: %s", batch_num, exc)
+        failures = list(remote_paths)
     if bar is not None:
         bar.update()
     return failures
@@ -4142,290 +4474,149 @@ class _BundleMountManager:
             LOG.warning("bundle mount cleanup failed for %s: %s", mountpoint, exc)
 
 
+def _stage_representatives(files: list[dict]) -> list[dict]:
+    by_path: dict[str, list[dict]] = {}
+    for entry in files:
+        by_path.setdefault(str(entry["remote_path"]).strip("/"), []).append(entry)
+    return [dict(entries[0], stage_size=max(_entry_stage_bytes(e) for e in entries))
+            for entries in by_path.values()]
+
+
+def _validate_retained_stage_limits(files: list[dict], max_files: int, max_bytes: int) -> None:
+    representatives = _stage_representatives(files)
+    if len(representatives) > max_files or sum(_entry_stage_bytes(e) for e in representatives) > max_bytes:
+        raise ValueError("--no-destage would retain more data than the staging limits; increase the limits or allow destaging")
+
+
 def _execute_pipeline_download(
-    files: list[dict],
-    transferer: Transferer,
-    stage_mgr: StageManager,
-    workers: int,
-    progress: Progress,
-    bar: ProgressBar,
-    stage_batch: int,
-    stage_batch_bytes: int,
-    stage_lifetime: str,
-    stage_poll: int,
-    stage_timeout: int,
-    destage: bool,
-    worker_fn=None,
-    result_handler=None,
+    files: list[dict], transferer: Transferer, stage_mgr: StageManager,
+    workers: int, progress: Progress, bar: ProgressBar, stage_batch: int,
+    stage_batch_bytes: int, stage_lifetime: str, stage_poll: int,
+    stage_timeout: int, destage: bool, worker_fn=None, result_handler=None,
 ):
-    """Pipeline: stage a batch → download as files come online → destage completed files.
-
-    This avoids filling the staging area with more data than can be held at once.
-    Files are processed in batches of ``stage_batch``.
-    """
-    batches = _build_stage_batches(files, stage_batch, stage_batch_bytes)
-    stage_started_at: dict[int, float] = {}
-    prestaged_batches: set[int] = set()
-    stage_request_ids: dict[int, list[str]] = {}
-
-    # Process in batches
-    for batch_index, batch_entries in enumerate(batches):
-        batch_paths = ["/" + e["remote_path"].strip("/") for e in batch_entries]
-        batch_path_to_entry = dict(zip(batch_paths, batch_entries))
-        batch_stage_entries = [(path, int(entry.get("size", 0))) for path, entry in batch_path_to_entry.items()]
-        batch_num = batch_index + 1
-        total_batches = len(batches)
-
-        if total_batches > 1:
-            LOG.info("batch %d/%d: staging %d file(s)", batch_num, total_batches, len(batch_paths))
-
-        fallback_enabled = stage_mgr.can_prime_via_webdav_range()
-
-        # Stage this batch
-        if batch_index not in prestaged_batches:
-            stage_request_ids[batch_index] = stage_mgr.stage(batch_paths, lifetime=stage_lifetime)
-            stage_started_at[batch_index] = time.monotonic()
-            if not fallback_enabled:
-                for path, size in batch_stage_entries:
-                    progress.mark_stage_requested(path, size)
-            bar.update()
-
-        # Wait for files in this batch to come online, then download them in daemon workers.
-        pending_stage = set(batch_paths)
+    """Stage unique sources in bounded batches, retaining every output request."""
+    moving = getattr(transferer, "delete_source", False) is True
+    _validate_transfer_plan(files, "download", moving)
+    by_path: dict[str, list[dict]] = {}
+    for entry in files:
+        path = "/" + entry["remote_path"].strip("/")
+        by_path.setdefault(path, []).append(entry)
+    representatives = _stage_representatives(files)
+    if not destage and not moving:
+        _validate_retained_stage_limits(files, stage_batch, stage_batch_bytes)
+    batches = _build_stage_batches(representatives, stage_batch, stage_batch_bytes)
+    for batch_index, batch in enumerate(batches):
+        paths = ["/" + e["remote_path"].strip("/") for e in batch]
+        stage_mgr.cancel_event.clear()
+        stage_mgr.deadline = time.monotonic() + stage_timeout
+        deadline = stage_mgr.deadline
+        pending_stage = set(paths)
         pending_downloads = 0
-        stage_error_messages: dict[str, str] = {}
-        deferred_destage_paths: list[str] = []
+        errors: dict[str, str] = {}
+        requested_fallback: set[str] = set()
+        initial_errors: dict[str, str] = {}
+        requests: list[str] = []
         pool = _DaemonWorkerPool(worker_fn or transferer.download, workers, name_prefix="stage-download-worker")
-        fallback_pool: _DaemonWorkerPool | None = None
-        if fallback_enabled:
-            fallback_pool = _DaemonWorkerPool(
-                stage_mgr.prime_via_webdav_range,
-                min(DEFAULT_STAGE_FALLBACK_WORKERS, max(len(batch_entries), 1)),
-                name_prefix="stage-fallback-worker",
-            )
-        fallback_requested_paths: set[str] = set()
-        fallback_inflight_paths: set[str] = set()
-        fallback_success_paths: set[str] = set()
-        fallback_failure_paths: set[str] = set()
-        fallback_success_log_count = 0
-        batch_total_bytes = sum(int(entry.get("size", 0)) for entry in batch_entries)
-        batch_completed_bytes = 0
-        batch_completed_files = 0
-        next_batch_index = batch_index + 1
-        next_batch_paths = ["/" + e["remote_path"].strip("/") for e in batches[next_batch_index]] if next_batch_index < total_batches else []
-        next_batch_stage_entries = [
-            ("/" + entry["remote_path"].strip("/"), int(entry.get("size", 0)))
-            for entry in batches[next_batch_index]
-        ] if next_batch_index < total_batches else []
-        batch_request_ids = stage_request_ids.get(batch_index, [])
-        prefetched_next_batch = False
+        fallback_pool = None
+        if stage_mgr.can_prime_via_webdav_range():
+            fallback_pool = _DaemonWorkerPool(stage_mgr.prime_via_webdav_range,
+                                             min(DEFAULT_STAGE_FALLBACK_WORKERS, len(paths)),
+                                             name_prefix="stage-fallback-worker")
+        def fail_path(path, exc):
+            pending_stage.discard(path)
+            for entry in by_path[path]:
+                _handle_failed_result(entry, exc, progress, bar)
 
         try:
-            is_tty = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
-            stage_start = stage_started_at.get(batch_index, time.monotonic())
-
+            LOG.info("batch %d/%d: staging %d unique file(s)", batch_index + 1, len(batches), len(paths))
+            try:
+                requests = stage_mgr.stage(paths, lifetime=stage_lifetime)
+            except (RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
+                if fallback_pool is None:
+                    raise
+                initial_errors = {path: str(exc) for path in paths}
+                LOG.info("initial ADA staging failed; trying WebDAV range-read fallback")
+            for entry in batch:
+                progress.mark_stage_requested("/" + entry["remote_path"].strip("/"), _entry_stage_bytes(entry))
+            next_poll = 0.0
             while pending_stage or pending_downloads:
+                if pending_stage and time.monotonic() >= deadline:
+                    exc = TimeoutError(_format_stage_timeout_error(pending_stage, errors))
+                    for path in list(pending_stage):
+                        fail_path(path, exc)
                 if fallback_pool is not None:
                     while True:
                         try:
-                            fallback_entry, fallback_exc, _ = fallback_pool.get_result_nowait()
+                            entry, exc, result = fallback_pool.get_result_nowait()
                         except queue.Empty:
                             break
-                        fallback_path = "/" + str(fallback_entry["remote_path"]).strip("/")
-                        fallback_inflight_paths.discard(fallback_path)
-                        if fallback_exc is None:
-                            if fallback_path in batch_path_to_entry:
-                                fallback_success_paths.add(fallback_path)
-                                timed_out = bool(fallback_entry.get("timed_out"))
-                                progress.mark_stage_requested(
-                                    fallback_path,
-                                    int(batch_path_to_entry[fallback_path].get("size", 0)),
-                                )
-                                previous_stage_error = (
-                                    stage_error_messages[fallback_path]
-                                    if fallback_path in stage_error_messages
-                                    else "ada stage failed"
-                                )
-                                if timed_out:
-                                    stage_error_messages[fallback_path] = previous_stage_error
-                                else:
-                                    stage_error_messages[fallback_path] = (
-                                        f"{previous_stage_error}; WebDAV fallback request completed successfully; waiting for ONLINE"
-                                    )
-                                if not fallback_inflight_paths and len(fallback_success_paths) > fallback_success_log_count:
-                                    bar.finish()
-                                    LOG.info(
-                                        "fallback: WebDAV priming requests finished for %d file(s) in batch %d/%d; waiting for them to come online",
-                                        len(fallback_success_paths),
-                                        batch_num,
-                                        total_batches,
-                                    )
-                                    bar.update()
-                                    fallback_success_log_count = len(fallback_success_paths)
+                        path = "/" + entry["remote_path"].strip("/")
+                        if path not in pending_stage:
                             continue
-                        if fallback_path not in pending_stage:
-                            continue
-                        fallback_failure_paths.add(fallback_path)
-                        stage_error_messages[fallback_path] = str(fallback_exc)
-                        pending_stage.discard(fallback_path)
-                        progress.clear_stage_state(fallback_path, int(batch_path_to_entry[fallback_path].get("size", 0)))
-                        _handle_failed_result(batch_path_to_entry[fallback_path], fallback_exc, progress, bar)
-
-                # Check which pending files are now online
-                newly_online: list[str] = []
-                if pending_stage:
-                    request_failures = stage_mgr.poll_stage_request_errors(batch_request_ids, pending_stage)
-                    for path, error in request_failures.items():
-                        if path not in fallback_requested_paths:
-                            stage_error_messages[path] = error
-                    newly_failed_stage_paths = [path for path in request_failures if path in pending_stage]
-                    new_fallback_paths: list[str] = []
-                    terminal_stage_failures: list[str] = []
-                    for path in newly_failed_stage_paths:
-                        if fallback_pool is not None:
-                            if path in fallback_requested_paths:
+                        if exc is not None:
+                            fail_path(path, exc)
+                        else:
+                            timed_out = bool((result or {}).get("timed_out"))
+                            errors[path] = "WebDAV read timed out; waiting for ONLINE" if timed_out else "WebDAV priming completed; waiting for ONLINE"
+                if pending_stage and time.monotonic() >= next_poll:
+                    try:
+                        failures = stage_mgr.poll_stage_request_errors(requests, pending_stage)
+                        failures.update(initial_errors)
+                        initial_errors.clear()
+                        for path, message in failures.items():
+                            if path not in pending_stage:
                                 continue
-                            new_fallback_paths.append(path)
-                            continue
-                        terminal_stage_failures.append(path)
-
-                    if new_fallback_paths:
-                        preview = ", ".join(batch_path_to_entry[path]["rel"] for path in new_fallback_paths[:3])
-                        suffix = "" if len(new_fallback_paths) <= 3 else f" (+{len(new_fallback_paths) - 3} more)"
-                        bar.finish()
-                        LOG.info(
-                            "fallback: switching %d file(s) in batch %d/%d to WebDAV range-read staging after ada stage failure: %s%s",
-                            len(new_fallback_paths),
-                            batch_num,
-                            total_batches,
-                            preview,
-                            suffix,
-                        )
-                        bar.update()
-                        for path in new_fallback_paths:
-                            fallback_pool.submit({
-                                "remote_path": path,
-                                "rel": batch_path_to_entry[path]["rel"],
-                                "size": batch_path_to_entry[path].get("size", 0),
-                            })
-                            fallback_requested_paths.add(path)
-                            fallback_inflight_paths.add(path)
-                            stage_error_messages[path] = f"{request_failures[path]}; trying WebDAV range-read fallback"
-                        bar.update()
-
-                    for path in terminal_stage_failures:
-                        pending_stage.discard(path)
-                        progress.clear_stage_state(path, int(batch_path_to_entry[path].get("size", 0)))
-                        _handle_failed_result(
-                            batch_path_to_entry[path],
-                            RuntimeError(request_failures[path]),
-                            progress,
-                            bar,
-                        )
-
-                    newly_online, poll_errors = stage_mgr.poll_online_statuses(list(pending_stage))
-                    for path, error in poll_errors.items():
-                        stage_error_messages[path] = error
-                    for path in newly_online:
-                        pending_stage.discard(path)
-                        stage_error_messages.pop(path, None)
-                        progress.mark_stage_online(path, int(batch_path_to_entry[path].get("size", 0)))
-                        entry = batch_path_to_entry[path]
-                        pool.submit(entry)
-                        pending_downloads += 1
-                    if newly_online:
-                        bar.update()
-
-                # Check completed downloads
-                done_results = 0
-                newly_destageable_paths: list[str] = []
-                while pending_downloads:
+                            errors[path] = message
+                            if fallback_pool is None:
+                                fail_path(path, RuntimeError(message))
+                            elif path not in requested_fallback:
+                                fallback_pool.submit(dict(by_path[path][0], remote_path=path))
+                                requested_fallback.add(path)
+                        online, poll_errors = stage_mgr.poll_online_statuses(list(pending_stage)) if pending_stage else ([], {})
+                        errors.update(poll_errors)
+                        for path in online:
+                            if path not in pending_stage:
+                                continue
+                            pending_stage.remove(path)
+                            progress.mark_stage_online(path, int(by_path[path][0].get("size", 0)))
+                            for entry in by_path[path]:
+                                pool.submit(entry)
+                                pending_downloads += 1
+                    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+                        for path in list(pending_stage):
+                            fail_path(path, exc)
+                    next_poll = time.monotonic() + stage_poll
+                if pending_downloads:
                     try:
-                        entry, exc, result = pool.get_result_nowait()
-                    except queue.Empty:
-                        break
-                    pending_downloads -= 1
-                    done_results += 1
-                    handled = _handle_worker_result(entry, exc, result, progress, bar, result_handler=result_handler)
-                    if handled is not None:
-                        batch_completed_bytes += int(entry.get("size", 0))
-                        batch_completed_files += 1
-                        newly_destageable_paths.append("/" + str(entry["remote_path"]).strip("/"))
-
-                if destage and newly_destageable_paths:
-                    deferred_destage_paths.extend(
-                        _destage_paths(stage_mgr, newly_destageable_paths, batch_num, bar)
-                    )
-
-                if (
-                    not prefetched_next_batch
-                    and next_batch_paths
-                    and not pending_stage
-                ):
-                    if batch_total_bytes > 0:
-                        completion_fraction = batch_completed_bytes / batch_total_bytes
-                    else:
-                        completion_fraction = batch_completed_files / len(batch_entries) if batch_entries else 1.0
-                    if completion_fraction >= 0.5:
-                        bar.finish()
-                        stage_request_ids[next_batch_index] = stage_mgr.stage(next_batch_paths, lifetime=stage_lifetime)
-                        stage_started_at[next_batch_index] = time.monotonic()
-                        prestaged_batches.add(next_batch_index)
-                        if not fallback_enabled:
-                            for path, size in next_batch_stage_entries:
-                                progress.mark_stage_requested(path, size)
-                        prefetched_next_batch = True
-                        LOG.info("pre-staging batch %d/%d while batch %d is still copying", next_batch_index + 1, total_batches, batch_num)
-                        bar.update()
-
-                # Check staging timeout
-                if pending_stage:
-                    if time.monotonic() - stage_start > stage_timeout:
-                        if is_tty:
-                            sys.stderr.write("\r\033[K")
-                            sys.stderr.flush()
-                        raise TimeoutError(_format_stage_timeout_error(pending_stage, stage_error_messages))
-                    if not done_results and not newly_online:
-                        time.sleep(stage_poll)
-                elif pending_downloads:
-                    # All staged, just wait for downloads to finish
-                    try:
-                        entry, exc, result = pool.get_result(timeout=10)
+                        entry, exc, result = pool.get_result(timeout=0.2)
                     except queue.Empty:
                         pass
                     else:
                         pending_downloads -= 1
-                        handled = _handle_worker_result(entry, exc, result, progress, bar, result_handler=result_handler)
-                        if handled is not None:
-                            batch_completed_bytes += int(entry.get("size", 0))
-                            batch_completed_files += 1
-                            completed_path = "/" + str(entry["remote_path"]).strip("/")
-                            if destage:
-                                deferred_destage_paths.extend(
-                                    _destage_paths(stage_mgr, [completed_path], batch_num, bar)
-                                )
-
+                        _handle_worker_result(entry, exc, result, progress, bar, result_handler=result_handler)
+                elif pending_stage:
+                    time.sleep(max(0, min(0.2, next_poll - time.monotonic(), deadline - time.monotonic())))
+                bar.update()
         except BaseException:
             pool.stop()
             if fallback_pool is not None:
                 fallback_pool.stop()
-            progress.clear_stage_states([(path, int(entry.get("size", 0))) for path, entry in batch_path_to_entry.items()])
-            if destage and deferred_destage_paths:
-                _destage_paths(stage_mgr, deferred_destage_paths, batch_num, bar)
-            if prefetched_next_batch and next_batch_paths:
-                _destage_paths(stage_mgr, next_batch_paths, next_batch_index + 1, bar)
-                progress.clear_stage_states(next_batch_stage_entries)
-            bar.update()
             raise
         finally:
             pool.finish_submissions()
             pool.join(timeout=1)
             if fallback_pool is not None:
-                fallback_pool.finish_submissions()
+                fallback_pool.stop()
                 fallback_pool.join(timeout=1)
-
-        if destage and deferred_destage_paths:
-            _destage_paths(stage_mgr, deferred_destage_paths, batch_num, bar)
+            stage_mgr.deadline = None
+            progress.clear_stage_states([(p, _entry_stage_bytes(by_path[p][0])) for p in paths])
+            if destage:
+                failures = _destage_paths(stage_mgr, paths, batch_index + 1, bar)
+                if failures:
+                    raise RuntimeError("could not release batch pins; refusing to stage more data")
+        # Failed moves can leave pins behind, so do not start another full batch.
+        if moving and progress.failed:
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -4473,7 +4664,7 @@ def build_parser(*, prog: str = "dcache_cp", delete_source: bool = False) -> arg
     )
     p.add_argument("--remote", default=os.environ.get("RCLONE_REMOTE"),
                     help="rclone remote name (default: only section in config)")
-    p.add_argument("--ada", default=_default_ada(),
+    p.add_argument("--ada",
                     help="ada executable for checksums and staging (default: bundled)")
     p.add_argument("--api", help="dCache API URL override")
     p.add_argument("--dry-run", action="store_true", help="Show planned transfers without copying")
@@ -4540,6 +4731,10 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
     setup_logging(args.verbose)
     _C.init()
 
+    if args.literal_file_list and not args.file_list:
+        LOG.error("--literal-file-list requires a download --file-list")
+        return 1
+
     # ---- Determine source/dest and direction ----
     if args.file_list:
         if args.bundle_small_files:
@@ -4549,17 +4744,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
             LOG.error("do not specify paths when using --file-list")
             return 1
         direction, files = load_file_list(args.file_list, allow_missing_local=delete_source)
-        # Detect remote prefix from first data row to resolve config.
-        with args.file_list.open("r") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                cols = line.split("\t")
-                src_pf, _ = parse_remote_prefix(cols[0].strip())
-                dst_pf, _ = parse_remote_prefix(cols[1].strip())
-                prefix = src_pf or dst_pf
-                break
+        prefix = files[0]["_prefix"]
 
     else:
         if len(args.paths) < 2:
@@ -4576,6 +4761,9 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
 
         if any(sp for sp in src_prefixes) and not all(sp for sp in src_prefixes):
             LOG.error("mix of local and remote sources is not supported")
+            return 1
+        if len(set(src_prefixes)) > 1:
+            LOG.error("mixed remote prefixes are not supported; use one remote per command")
             return 1
         src_prefix = src_prefixes[0] if src_prefixes else None
 
@@ -4601,7 +4789,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
                     _, src_path = parse_remote_prefix(src_raw)
                     try:
                         files.extend(plan_upload(Path(src_path), dst_path_dir, args.recursive,
-                                                 spinner=spinner))
+                                                 spinner=spinner, move=delete_source))
                     except ValueError as exc:
                         LOG.error("%s", exc)
                         return 1
@@ -4633,11 +4821,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
                 LOG.error("--bundle-small-files requires directory sources, but %s is not a directory", bundle_source)
                 return 1
 
-    # ---- Resolve config ----
-    rclone_config = resolve_config_for_prefix(prefix, args.config)
-    config = load_rclone_config(rclone_config)
-    remote = resolve_remote_name(config, args.remote)
-    api = resolve_api_url(args.api, config[remote])
+
     if args.literal_file_list:
         if not args.file_list or direction != "download":
             LOG.error("--literal-file-list requires a download --file-list")
@@ -4645,6 +4829,16 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
         if delete_source:
             LOG.error("--literal-file-list is not supported for download moves")
             return 1
+
+    if args.retry_wait < 0 or args.checksum_timeout <= 0 or args.stage_timeout <= 0 or args.stage_poll < 0:
+        LOG.error("retry/poll intervals must be >= 0 and checksum/stage timeouts must be > 0")
+        return 1
+
+    # ---- Resolve config ----
+    rclone_config = resolve_config_for_prefix(prefix, args.config)
+    config = load_rclone_config(rclone_config)
+    remote = resolve_remote_name(config, args.remote)
+    api = resolve_api_url(args.api, config[remote])
     download_bundle_enabled = (
         direction == "download"
         and not args.literal_file_list
@@ -4660,6 +4854,9 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
         if download_bundle_resolver is None:
             download_bundle_resolver = _BundleDownloadResolver(rclone_config, remote, api, config[remote])
         return download_bundle_resolver
+
+    if args.file_list or direction == "upload":
+        _validate_transfer_plan(files, direction, delete_source)
 
     if args.file_list and delete_source and direction == "upload":
         files = _filter_resumed_move_upload_file_list_entries(rclone_config, remote, files)
@@ -4704,7 +4901,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
                             rclone_config,
                             remote,
                             src_path,
-                            Path(dst_path_dir),
+                            dst_path_dir,
                             args.recursive,
                             _get_download_bundle_resolver(),
                             spinner=spinner,
@@ -4717,7 +4914,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
                                 rclone_config,
                                 remote,
                                 src_path,
-                                Path(dst_path_dir),
+                                dst_path_dir,
                                 args.recursive,
                                 spinner=spinner,
                             )
@@ -4727,6 +4924,8 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
                     return 1
         files = plain_download_entries
         download_bundle_entries = _merge_bundle_download_entries(pending_bundle_entries)
+
+    _validate_transfer_plan([*files, *download_bundle_entries], direction, delete_source)
 
     # ---- Validate ----
     if args.workers < 1:
@@ -4764,27 +4963,8 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
             return 1
         files = list(bundle_plan.plain_entries)
 
-    # ---- Transferer ----
-    transferer = Transferer(
-        rclone_config=rclone_config, remote=remote, ada_cmd=args.ada,
-        api=api, max_retries=args.max_retries, retry_wait=args.retry_wait,
-        copy_timeout=args.copy_timeout, checksum_timeout=args.checksum_timeout,
-        skip_verified=args.skip_verified, delete_source=delete_source,
-    )
-
-    pre_skipped_entries: list[dict] = []
-    if direction == "download" and args.skip_verified and not delete_source:
-        LOG.info("resume  : checking for already verified local files before download")
-        files, skipped_plain_entries = _filter_verified_download_entries(files, transferer)
-        pre_skipped_entries.extend(skipped_plain_entries)
-        if download_bundle_entries:
-            download_bundle_entries, skipped_bundle_entries = _filter_verified_download_entries(download_bundle_entries, transferer)
-            pre_skipped_entries.extend(skipped_bundle_entries)
-
-    total_bytes = planned_total_bytes
-    remaining_bytes = sum(_entry_logical_bytes(entry) for entry in [*files, *download_bundle_entries])
-
     # ---- Dry run ----
+    # Return before resume verification or source deletion can run.
     if args.dry_run:
         LOG.info("dry run (%s): %d logical file(s), %s", direction, planned_total_files, format_bytes(planned_total_bytes))
         plain_remaining_bytes = sum(_entry_logical_bytes(entry) for entry in files)
@@ -4857,12 +5037,36 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
                 )
         return 0
 
+    if direction == "download" and not args.no_stage and args.no_destage:
+        _validate_retained_stage_limits(planned_entries, args.stage_batch, args.stage_batch_bytes)
+
+    args.ada = args.ada or _default_ada()
+
+    # ---- Transferer ----
+    transferer = Transferer(
+        rclone_config=rclone_config, remote=remote, ada_cmd=args.ada,
+        api=api, max_retries=args.max_retries, retry_wait=args.retry_wait,
+        copy_timeout=args.copy_timeout, checksum_timeout=args.checksum_timeout,
+        skip_verified=args.skip_verified, delete_source=delete_source,
+    )
+
+    pre_skipped_entries: list[dict] = []
+    if direction == "download" and args.skip_verified and not delete_source:
+        LOG.info("resume  : checking for already verified local files before download")
+        files, skipped_plain_entries = _filter_verified_download_entries(files, transferer)
+        pre_skipped_entries.extend(skipped_plain_entries)
+        if download_bundle_entries:
+            download_bundle_entries, skipped_bundle_entries = _filter_verified_download_entries(download_bundle_entries, transferer)
+            pre_skipped_entries.extend(skipped_bundle_entries)
+
+    total_bytes = planned_total_bytes
+
     # ---- Quota tracker ----
     quota: QuotaTracker | None = None
     quota_poller: _QuotaPoller | None = None
     quota_pool = args.quota_pool or resolve_pool_for_config(rclone_config)
     if quota_pool:
-        quota = QuotaTracker(args.ada, rclone_config, api, quota_pool)
+        quota = QuotaTracker(args.ada, rclone_config, api, quota_pool, remote=remote)
         quota_poller = _QuotaPoller(quota)
         quota_poller.start()
 
@@ -5059,7 +5263,11 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
                     result_handler=download_bundle_result_handler,
                 )
     except KeyboardInterrupt:
+        transferer.cancel()
         interrupted = True
+    except (RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
+        progress.failure("pipeline", 0, exc)
+        LOG.error("pipeline failed: %s", exc)
     finally:
         bar.stop()
         bar.finish()
@@ -5079,7 +5287,7 @@ def main(argv: list[str] | None = None, *, prog: str = "dcache_cp", delete_sourc
 
     if interrupted:
         return 130
-    return 1 if progress.failed else 0
+    return 1 if progress.failed or progress.validated_files != planned_total_files else 0
 
 
 def _run_entry_point(*, prog: str, delete_source: bool) -> None:
@@ -5088,7 +5296,7 @@ def _run_entry_point(*, prog: str, delete_source: bool) -> None:
     except KeyboardInterrupt:
         LOG.warning("interrupted")
         raise SystemExit(130)
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
         LOG.error("%s", exc)
         raise SystemExit(1)
 
